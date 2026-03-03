@@ -14,6 +14,7 @@ func (c *Client) CheckUpdate(ctx context.Context, currentVersion string, version
 		Platform:       c.Platform,
 		Arch:           c.Arch,
 		DeviceID:       c.DeviceID,
+		UserID:         c.UserID,
 		Attributes:     c.Attributes,
 	}
 	body, _ := json.Marshal(req)
@@ -36,4 +37,3 @@ func (c *Client) CheckUpdate(ctx context.Context, currentVersion string, version
 	}
 	return out, nil
 }
-

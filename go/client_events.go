@@ -55,6 +55,9 @@ func (c *Client) ReportHeartbeat(ctx context.Context, appVersion string) error {
 	if c.Arch != "" {
 		payload["arch"] = c.Arch
 	}
+	if c.UserID != "" {
+		payload["user_id"] = c.UserID
+	}
 	if c.Attributes != nil && len(c.Attributes) > 0 {
 		payload["attributes"] = c.Attributes
 	}
@@ -72,7 +75,7 @@ func (c *Client) ReportHeartbeat(ctx context.Context, appVersion string) error {
 
 func (c *Client) ReportEvents(ctx context.Context, events []Event) error {
 	payload := map[string]interface{}{
-		"events":  events,
+		"events": events,
 	}
 	body, _ := json.Marshal(payload)
 	resp, err := c.doRequest(ctx, http.MethodPost, "/api/client/events", body)
@@ -155,4 +158,3 @@ func (c *Client) ReportFeedback(ctx context.Context, content string, rating *int
 	}
 	return nil
 }
-
