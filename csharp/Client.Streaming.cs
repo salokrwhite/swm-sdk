@@ -45,7 +45,7 @@ public partial class Client
                 catch (Exception ex)
                 {
                     options.OnError?.Invoke(ex);
-                    if (ex is SwmDeviceBlockedException || ex is SwmUnauthorizedException)
+                    if (ex is SwmDeviceBlockedException || ex is SwmUpdateRegionBlockedException || ex is SwmUnauthorizedException)
                     {
                         return;
                     }

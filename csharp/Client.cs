@@ -2,6 +2,8 @@ using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Org.BouncyCastle.Crypto.Parameters;
+using Org.BouncyCastle.Crypto.Signers;
 
 namespace SwmSdk;
 
@@ -9,6 +11,7 @@ public partial class Client
 {
     public const string ControlEventShutdown = "device_shutdown";
     public const string ApiErrorCodeDeviceBlocked = "device_blocked";
+    public const string ApiErrorCodeUpdateRegionBlocked = "update_region_blocked";
 
     public string BaseUrl { get; }
     public string AppId { get; }
@@ -18,6 +21,7 @@ public partial class Client
     public string Platform { get; set; } = string.Empty;
     public string Arch { get; set; } = string.Empty;
     public string DeviceId { get; set; } = string.Empty;
+    public string UserId { get; set; } = string.Empty;
     public Dictionary<string, object?> Attributes { get; set; } = new();
     public string? PublicKey { get; set; }
     public bool VerifySignature { get; set; }
@@ -80,20 +84,36 @@ public partial class Client
 
     private bool VerifySignatureInternal(string checksumHex, string signature)
     {
+        if (!VerifySignature)
+        {
+            return true;
+        }
+
         if (SignatureVerifier != null)
         {
             return SignatureVerifier(checksumHex, signature);
         }
 
-        if (!VerifySignature || string.IsNullOrWhiteSpace(PublicKey))
+        if (string.IsNullOrWhiteSpace(PublicKey))
         {
             return true;
         }
 
-        _ = DecodeBase64OrHex(PublicKey!);
-        _ = DecodeBase64OrHex(signature);
-        _ = Encoding.UTF8.GetBytes(checksumHex);
-        throw new SwmApiException(0, null, "provide SignatureVerifier callback for signature verification");
+        var publicKeyBytes = DecodeBase64OrHex(PublicKey!);
+        var signatureBytes = DecodeBase64OrHex(signature);
+        var messageBytes = Encoding.UTF8.GetBytes(checksumHex);
+
+        try
+        {
+            var verifier = new Ed25519Signer();
+            verifier.Init(false, new Ed25519PublicKeyParameters(publicKeyBytes, 0));
+            verifier.BlockUpdate(messageBytes, 0, messageBytes.Length);
+            return verifier.VerifySignature(signatureBytes);
+        }
+        catch (Exception ex) when (ex is ArgumentException || ex is InvalidOperationException)
+        {
+            throw new SwmApiException(0, null, $"invalid ed25519 verification parameters: {ex.Message}");
+        }
     }
 
     private async Task<HttpResponseMessage> DoRequestAsync(HttpMethod method, string path, HttpContent? body = null, CancellationToken cancellationToken = default)
@@ -184,6 +204,7 @@ public partial class Client
 
     public async Task<UpdateCheckResponse> CheckUpdateAsync(string currentVersion, int? versionCode = null, string? userId = null, CancellationToken cancellationToken = default)
     {
+        var effectiveUserId = string.IsNullOrWhiteSpace(userId) ? UserId : userId;
         var payload = new UpdateCheckRequest
         {
             ChannelCode = Channel,
@@ -192,7 +213,7 @@ public partial class Client
             Platform = Platform,
             Arch = Arch,
             DeviceId = DeviceId,
-            UserId = userId,
+            UserId = string.IsNullOrWhiteSpace(effectiveUserId) ? null : effectiveUserId,
             Attributes = JsonDefaults.ToJsonElementMap(Attributes)
         };
         using var res = await DoRequestAsync(HttpMethod.Post, "/api/client/update-check", JsonDefaults.ToJsonContent(payload, SwmJsonContext.Default.UpdateCheckRequest), cancellationToken).ConfigureAwait(false);
@@ -235,6 +256,7 @@ public partial class Client
 
     public async Task ReportHeartbeatAsync(string? appVersion = null, string? userId = null, CancellationToken cancellationToken = default)
     {
+        var effectiveUserId = string.IsNullOrWhiteSpace(userId) ? UserId : userId;
         if (string.IsNullOrWhiteSpace(DeviceId))
         {
             throw new SwmValidationException(400, null, "device_id required");
@@ -246,7 +268,7 @@ public partial class Client
             AppVersion = appVersion,
             Platform = string.IsNullOrWhiteSpace(Platform) ? null : Platform,
             Arch = string.IsNullOrWhiteSpace(Arch) ? null : Arch,
-            UserId = userId,
+            UserId = string.IsNullOrWhiteSpace(effectiveUserId) ? null : effectiveUserId,
             Attributes = Attributes.Count > 0 ? JsonDefaults.ToJsonElementMap(Attributes) : null
         };
 
