@@ -204,6 +204,17 @@ public partial class Client
                 Reason = evt.Reason
             });
         }
+        if (string.Equals(evt.EventType, ControlEventMaintenanceScheduled, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(evt.EventType, ControlEventMaintenanceCancelled, StringComparison.OrdinalIgnoreCase))
+        {
+            options.OnControlEvent?.Invoke(new ControlEvent
+            {
+                Type = evt.EventType!,
+                Reason = evt.Reason,
+                Message = evt.Message,
+                StartAt = evt.MaintenanceStartAt
+            });
+        }
         onEvent(evt);
         return Task.CompletedTask;
     }

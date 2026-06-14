@@ -13,6 +13,7 @@ namespace SwmSdk;
 [JsonSerializable(typeof(EventBatchRequest))]
 [JsonSerializable(typeof(HeartbeatRequest))]
 [JsonSerializable(typeof(UpdatePushEvent))]
+[JsonSerializable(typeof(Maintenance))]
 [JsonSerializable(typeof(DynamicRequest))]
 [JsonSerializable(typeof(DynamicDto))]
 [JsonSerializable(typeof(AppDto))]

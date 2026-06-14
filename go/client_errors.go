@@ -38,6 +38,12 @@ func parseAPIErrorResponse(resp *http.Response) error {
 		if strings.EqualFold(strings.TrimSpace(nested.Code), APIErrorCodeDeviceBlocked) {
 			return ErrDeviceBlocked
 		}
+		if strings.EqualFold(strings.TrimSpace(nested.Code), APIErrorCodeUpdateRegionBlocked) {
+			return ErrUpdateRegionBlocked
+		}
+		if strings.EqualFold(strings.TrimSpace(nested.Code), APIErrorCodeFeedbackDisabled) {
+			return ErrFeedbackDisabled
+		}
 		if strings.TrimSpace(nested.Message) != "" {
 			return fmt.Errorf("%s: %s", nested.Code, nested.Message)
 		}
@@ -46,9 +52,11 @@ func parseAPIErrorResponse(resp *http.Response) error {
 
 	var flat string
 	if err := json.Unmarshal(parsed.Error, &flat); err == nil && strings.TrimSpace(flat) != "" {
+		if strings.EqualFold(strings.TrimSpace(flat), APIErrorCodeFeedbackDisabled) {
+			return ErrFeedbackDisabled
+		}
 		return fmt.Errorf("%s", strings.TrimSpace(flat))
 	}
 
 	return fmt.Errorf("request failed: %s", resp.Status)
 }
-

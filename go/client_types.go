@@ -9,17 +9,23 @@ import (
 )
 
 const (
-	ControlEventShutdown      = "device_shutdown"
-	APIErrorCodeDeviceBlocked = "device_blocked"
-	signHeaderAppID           = "X-App-Id"
-	signHeaderTimestamp       = "X-Timestamp"
-	signHeaderNonce           = "X-Nonce"
-	signHeaderSignature       = "X-Signature"
-	signHeaderVersion         = "X-Sign-Version"
-	signVersionV1             = "v1"
+	ControlEventShutdown             = "device_shutdown"
+	ControlEventMaintenanceScheduled = "maintenance_scheduled"
+	ControlEventMaintenanceCancelled = "maintenance_cancelled"
+	APIErrorCodeDeviceBlocked        = "device_blocked"
+	APIErrorCodeUpdateRegionBlocked  = "update_region_blocked"
+	APIErrorCodeFeedbackDisabled     = "feedback_disabled"
+	signHeaderAppID                  = "X-App-Id"
+	signHeaderTimestamp              = "X-Timestamp"
+	signHeaderNonce                  = "X-Nonce"
+	signHeaderSignature              = "X-Signature"
+	signHeaderVersion                = "X-Sign-Version"
+	signVersionV1                    = "v1"
 )
 
 var ErrDeviceBlocked = errors.New("device blocked")
+var ErrUpdateRegionBlocked = errors.New("update region blocked")
+var ErrFeedbackDisabled = errors.New("feedback disabled")
 
 type Client struct {
 	BaseURL         string
@@ -51,19 +57,27 @@ type UpdateCheckRequest struct {
 }
 
 type UpdateCheckResponse struct {
-	UpdateAvailable          bool   `json:"update_available"`
-	Mandatory                bool   `json:"mandatory"`
-	HeartbeatIntervalSeconds int    `json:"heartbeat_interval_seconds"`
-	OpenInBrowser            bool   `json:"open_in_browser"`
-	DeliveryMethod           string `json:"delivery_method"`
-	ReleaseID                string `json:"release_id"`
-	Version                  string `json:"version"`
-	Notes                    string `json:"notes"`
-	DownloadURL              string `json:"download_url"`
-	ChecksumSHA256           string `json:"checksum_sha256"`
-	Signature                string `json:"signature"`
-	Size                     int64  `json:"size"`
-	RollbackAllowed          bool   `json:"rollback_allowed"`
+	UpdateAvailable          bool         `json:"update_available"`
+	Mandatory                bool         `json:"mandatory"`
+	HeartbeatIntervalSeconds int          `json:"heartbeat_interval_seconds"`
+	OpenInBrowser            bool         `json:"open_in_browser"`
+	DeliveryMethod           string       `json:"delivery_method"`
+	ReleaseID                string       `json:"release_id"`
+	Version                  string       `json:"version"`
+	Notes                    string       `json:"notes"`
+	DownloadURL              string       `json:"download_url"`
+	ChecksumSHA256           string       `json:"checksum_sha256"`
+	Signature                string       `json:"signature"`
+	Size                     int64        `json:"size"`
+	RollbackAllowed          bool         `json:"rollback_allowed"`
+	Maintenance              *Maintenance `json:"maintenance,omitempty"`
+}
+
+type Maintenance struct {
+	Enabled bool   `json:"enabled"`
+	StartAt string `json:"start_at,omitempty"`
+	Message string `json:"message,omitempty"`
+	Active  bool   `json:"active"`
 }
 
 type Event struct {
@@ -76,23 +90,27 @@ type Event struct {
 }
 
 type UpdatePushEvent struct {
-	ID          string    `json:"id"`
-	EventType   string    `json:"event_type"`
-	OrgID       string    `json:"org_id"`
-	AppID       string    `json:"app_id"`
-	DeviceID    string    `json:"device_id,omitempty"`
-	ChannelCode string    `json:"channel_code"`
-	Platform    string    `json:"platform"`
-	Arch        string    `json:"arch"`
-	ReleaseID   string    `json:"release_id"`
-	PublishedAt time.Time `json:"published_at"`
-	Reason      string    `json:"reason"`
+	ID                 string     `json:"id"`
+	EventType          string     `json:"event_type"`
+	OrgID              string     `json:"org_id"`
+	AppID              string     `json:"app_id"`
+	DeviceID           string     `json:"device_id,omitempty"`
+	ChannelCode        string     `json:"channel_code"`
+	Platform           string     `json:"platform"`
+	Arch               string     `json:"arch"`
+	ReleaseID          string     `json:"release_id"`
+	PublishedAt        time.Time  `json:"published_at"`
+	Reason             string     `json:"reason"`
+	Message            string     `json:"message,omitempty"`
+	MaintenanceStartAt *time.Time `json:"maintenance_start_at,omitempty"`
 }
 
 type ControlEvent struct {
 	Type     string
 	DeviceID string
 	Reason   string
+	Message  string
+	StartAt  time.Time
 }
 
 type UpdateStreamOptions struct {

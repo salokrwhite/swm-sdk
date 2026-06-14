@@ -134,14 +134,17 @@ func (c *Client) ReportFeedback(ctx context.Context, content string, rating *int
 		if err != nil {
 			return err
 		}
-		func() {
+		if err := func() error {
 			defer file.Close()
 			part, err := writer.CreateFormFile("attachments", filepath.Base(filePath))
 			if err != nil {
-				return
+				return err
 			}
-			_, _ = io.Copy(part, file)
-		}()
+			_, err = io.Copy(part, file)
+			return err
+		}(); err != nil {
+			return err
+		}
 	}
 
 	_ = writer.Close()

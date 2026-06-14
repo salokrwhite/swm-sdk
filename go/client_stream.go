@@ -183,6 +183,19 @@ func (c *Client) connectAndReadSSE(ctx context.Context, options UpdateStreamOpti
 							Reason:   evt.Reason,
 						})
 					}
+					if evt.EventType == ControlEventMaintenanceScheduled || evt.EventType == ControlEventMaintenanceCancelled {
+						if options.OnControlEvent != nil {
+							ctrl := ControlEvent{
+								Type:    evt.EventType,
+								Reason:  evt.Reason,
+								Message: evt.Message,
+							}
+							if evt.MaintenanceStartAt != nil {
+								ctrl.StartAt = *evt.MaintenanceStartAt
+							}
+							options.OnControlEvent(ctrl)
+						}
+					}
 					if onEvent != nil {
 						onEvent(evt)
 					}
@@ -210,4 +223,3 @@ func (c *Client) connectAndReadSSE(ctx context.Context, options UpdateStreamOpti
 	}
 	return resp.StatusCode, nil
 }
-

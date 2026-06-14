@@ -43,8 +43,8 @@ catch (SwmDeviceBlockedException)
 
 ## 签名验证说明
 
-若启用 `VerifySignature=true`，请设置 `SignatureVerifier` 回调。  
-为了兼容多目标框架和 AOT，SDK 默认不内置自动 Ed25519 验签实现。
+若启用 `VerifySignature=true` 且设置了 `PublicKey`，SDK 会自动执行 Ed25519 验签。  
+如果你需要自定义验签实现（例如接入 HSM），可设置 `SignatureVerifier` 回调覆盖默认行为。
 
 ## SSE 下线控制事件
 

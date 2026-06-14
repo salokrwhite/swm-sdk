@@ -10,8 +10,11 @@ namespace SwmSdk;
 public partial class Client
 {
     public const string ControlEventShutdown = "device_shutdown";
+    public const string ControlEventMaintenanceScheduled = "maintenance_scheduled";
+    public const string ControlEventMaintenanceCancelled = "maintenance_cancelled";
     public const string ApiErrorCodeDeviceBlocked = "device_blocked";
     public const string ApiErrorCodeUpdateRegionBlocked = "update_region_blocked";
+    public const string ApiErrorCodeFeedbackDisabled = "feedback_disabled";
 
     public string BaseUrl { get; }
     public string AppId { get; }

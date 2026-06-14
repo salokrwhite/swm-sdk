@@ -73,6 +73,24 @@ public sealed class UpdateCheckResponse
 
     [JsonPropertyName("release_notes_url")]
     public string? ReleaseNotesUrl { get; set; }
+
+    [JsonPropertyName("maintenance")]
+    public Maintenance? Maintenance { get; set; }
+}
+
+public sealed class Maintenance
+{
+    [JsonPropertyName("enabled")]
+    public bool Enabled { get; set; }
+
+    [JsonPropertyName("start_at")]
+    public string? StartAt { get; set; }
+
+    [JsonPropertyName("message")]
+    public string? Message { get; set; }
+
+    [JsonPropertyName("active")]
+    public bool Active { get; set; }
 }
 
 public sealed class EventIngestItem
@@ -160,6 +178,12 @@ public sealed class UpdatePushEvent
 
     [JsonPropertyName("reason")]
     public string? Reason { get; set; }
+
+    [JsonPropertyName("message")]
+    public string? Message { get; set; }
+
+    [JsonPropertyName("maintenance_start_at")]
+    public DateTime? MaintenanceStartAt { get; set; }
 }
 
 public sealed class ControlEvent
@@ -167,6 +191,8 @@ public sealed class ControlEvent
     public string Type { get; set; } = string.Empty;
     public string? DeviceId { get; set; }
     public string? Reason { get; set; }
+    public string? Message { get; set; }
+    public DateTime? StartAt { get; set; }
 }
 
 public sealed class UpdateStreamOptions

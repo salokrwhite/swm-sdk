@@ -28,6 +28,13 @@ public sealed class SwmUpdateRegionBlockedException : SwmApiException
     }
 }
 
+public sealed class SwmFeedbackDisabledException : SwmApiException
+{
+    public SwmFeedbackDisabledException(int statusCode, string message) : base(statusCode, Client.ApiErrorCodeFeedbackDisabled, message)
+    {
+    }
+}
+
 public sealed class SwmUnauthorizedException : SwmApiException
 {
     public SwmUnauthorizedException(int statusCode, string? errorCode, string message) : base(statusCode, errorCode, message)
@@ -101,6 +108,10 @@ internal static class SwmErrorParser
         if (string.Equals(code, Client.ApiErrorCodeUpdateRegionBlocked, StringComparison.OrdinalIgnoreCase))
         {
             throw new SwmUpdateRegionBlockedException(statusCode, message);
+        }
+        if (string.Equals(code, Client.ApiErrorCodeFeedbackDisabled, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new SwmFeedbackDisabledException(statusCode, message);
         }
 
         if (statusCode == 401 || statusCode == 403)
