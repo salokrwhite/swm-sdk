@@ -25,7 +25,7 @@ func (c *Client) ReportEvent(ctx context.Context, eventName string, props map[st
 		Attributes:  c.Attributes,
 	}
 	body, _ := json.Marshal(event)
-	resp, err := c.doRequest(ctx, http.MethodPost, "/api/client/events", body)
+	resp, nonce, err := c.doRequestCapturingNonce(ctx, http.MethodPost, "/api/client/events", body)
 	if err != nil {
 		return err
 	}
@@ -33,7 +33,7 @@ func (c *Client) ReportEvent(ctx context.Context, eventName string, props map[st
 	if resp.StatusCode >= 300 {
 		return parseAPIErrorResponse(resp)
 	}
-	return nil
+	return c.verifyResponseAuthz(resp, nonce)
 }
 
 func (c *Client) ReportHeartbeat(ctx context.Context, appVersion string) error {
@@ -62,7 +62,7 @@ func (c *Client) ReportHeartbeat(ctx context.Context, appVersion string) error {
 		payload["attributes"] = c.Attributes
 	}
 	body, _ := json.Marshal(payload)
-	resp, err := c.doRequest(ctx, http.MethodPost, "/api/client/heartbeat", body)
+	resp, nonce, err := c.doRequestCapturingNonce(ctx, http.MethodPost, "/api/client/heartbeat", body)
 	if err != nil {
 		return err
 	}
@@ -70,7 +70,7 @@ func (c *Client) ReportHeartbeat(ctx context.Context, appVersion string) error {
 	if resp.StatusCode >= 300 {
 		return parseAPIErrorResponse(resp)
 	}
-	return nil
+	return c.verifyResponseAuthz(resp, nonce)
 }
 
 func (c *Client) ReportEvents(ctx context.Context, events []Event) error {
@@ -78,7 +78,7 @@ func (c *Client) ReportEvents(ctx context.Context, events []Event) error {
 		"events": events,
 	}
 	body, _ := json.Marshal(payload)
-	resp, err := c.doRequest(ctx, http.MethodPost, "/api/client/events", body)
+	resp, nonce, err := c.doRequestCapturingNonce(ctx, http.MethodPost, "/api/client/events", body)
 	if err != nil {
 		return err
 	}
@@ -86,7 +86,7 @@ func (c *Client) ReportEvents(ctx context.Context, events []Event) error {
 	if resp.StatusCode >= 300 {
 		return parseAPIErrorResponse(resp)
 	}
-	return nil
+	return c.verifyResponseAuthz(resp, nonce)
 }
 
 func (c *Client) ReportFeedback(ctx context.Context, content string, rating *int, contact string, attachments []string, metadata map[string]interface{}) error {
@@ -150,7 +150,7 @@ func (c *Client) ReportFeedback(ctx context.Context, content string, rating *int
 	_ = writer.Close()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/api/client/feedback", &buf)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
-	c.signRequestHeaders(req, buf.Bytes(), c.AppSecret, c.AppID, true)
+	nonce := c.signRequestHeaders(req, buf.Bytes(), c.AppSecret, c.AppID, true)
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return err
@@ -159,5 +159,5 @@ func (c *Client) ReportFeedback(ctx context.Context, content string, rating *int
 	if resp.StatusCode >= 300 {
 		return parseAPIErrorResponse(resp)
 	}
-	return nil
+	return c.verifyResponseAuthz(resp, nonce)
 }

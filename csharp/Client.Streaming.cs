@@ -124,13 +124,16 @@ public partial class Client
 
         using var req = new HttpRequestMessage(HttpMethod.Get, url);
         req.Headers.Accept.ParseAdd("text/event-stream");
-        SignClientRequest(req, Array.Empty<byte>());
+        var nonce = SignClientRequest(req, Array.Empty<byte>());
         using var res = await HttpClient.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
         await SwmErrorParser.ThrowIfErrorAsync(res, cancellationToken).ConfigureAwait(false);
 
         using var stream = await res.Content.ReadAsStreamAsync().ConfigureAwait(false);
         using var reader = new StreamReader(stream);
         var message = new SseMessage();
+        // When RequireAuthz, ignore pushed events until the stream proves it comes
+        // from the real server via a valid signed authz event.
+        var authzOk = !RequireAuthz;
         while (!reader.EndOfStream && !cancellationToken.IsCancellationRequested)
         {
             var line = await reader.ReadLineAsync().ConfigureAwait(false);
@@ -144,7 +147,7 @@ public partial class Client
             }
             if (line.Length == 0)
             {
-                await FlushMessageAsync(message, options, onEvent).ConfigureAwait(false);
+                HandleSseMessage(message, options, onEvent, nonce, ref authzOk);
                 message = new SseMessage();
                 continue;
             }
@@ -169,22 +172,41 @@ public partial class Client
         }
     }
 
-    private static Task FlushMessageAsync(SseMessage message, UpdateStreamOptions options, Action<UpdatePushEvent> onEvent)
+    private void HandleSseMessage(SseMessage message, UpdateStreamOptions options, Action<UpdatePushEvent> onEvent, string requestNonce, ref bool authzOk)
     {
         if (message.Data.Length == 0)
         {
-            return Task.CompletedTask;
+            return;
         }
         if (string.Equals(message.EventName, "connected", StringComparison.OrdinalIgnoreCase))
         {
-            return Task.CompletedTask;
+            return;
         }
 
         var payload = message.Data.ToString();
+
+        // The server emits a signed authz verdict as the first event. When
+        // RequireAuthz, verify it (throws to fail closed) before trusting any
+        // pushed event; ignore everything until it is verified.
+        if (string.Equals(message.EventName, "authz", StringComparison.OrdinalIgnoreCase))
+        {
+            if (RequireAuthz)
+            {
+                var env = JsonSerializer.Deserialize(payload, SwmJsonContext.Default.AuthzEnvelope);
+                VerifyAuthzOrThrow(env, requestNonce);
+                authzOk = true;
+            }
+            return;
+        }
+        if (!authzOk)
+        {
+            return;
+        }
+
         var evt = JsonSerializer.Deserialize(payload, SwmJsonContext.Default.UpdatePushEvent);
         if (evt == null)
         {
-            return Task.CompletedTask;
+            return;
         }
         if (string.IsNullOrWhiteSpace(evt.Id))
         {
@@ -216,6 +238,5 @@ public partial class Client
             });
         }
         onEvent(evt);
-        return Task.CompletedTask;
     }
 }

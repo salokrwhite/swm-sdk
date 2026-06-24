@@ -40,9 +40,20 @@ type Client struct {
 	Attributes      map[string]interface{}
 	PublicKey       string
 	VerifySignature bool
-	Retries         int
-	Backoff         time.Duration
-	HTTPClient      *http.Client
+	// RequireAuthz makes every client call that can carry a signed verdict
+	// (update-check, heartbeat, events, feedback, stream) fail closed unless the
+	// response is accompanied by a valid Ed25519-signed "allow" bound to this
+	// request and device. Leave false for consumers that don't use device authz.
+	RequireAuthz bool
+	// AuthzPublicKeys maps key_id -> Ed25519 public key (hex or base64). The
+	// matching private key lives only on the server.
+	AuthzPublicKeys map[string]string
+	// AuthzClockSkewSeconds tolerates clock skew when checking verdict expiry
+	// (default 120 when <= 0).
+	AuthzClockSkewSeconds int
+	Retries               int
+	Backoff               time.Duration
+	HTTPClient            *http.Client
 }
 
 type UpdateCheckRequest struct {
@@ -57,20 +68,21 @@ type UpdateCheckRequest struct {
 }
 
 type UpdateCheckResponse struct {
-	UpdateAvailable          bool         `json:"update_available"`
-	Mandatory                bool         `json:"mandatory"`
-	HeartbeatIntervalSeconds int          `json:"heartbeat_interval_seconds"`
-	OpenInBrowser            bool         `json:"open_in_browser"`
-	DeliveryMethod           string       `json:"delivery_method"`
-	ReleaseID                string       `json:"release_id"`
-	Version                  string       `json:"version"`
-	Notes                    string       `json:"notes"`
-	DownloadURL              string       `json:"download_url"`
-	ChecksumSHA256           string       `json:"checksum_sha256"`
-	Signature                string       `json:"signature"`
-	Size                     int64        `json:"size"`
-	RollbackAllowed          bool         `json:"rollback_allowed"`
-	Maintenance              *Maintenance `json:"maintenance,omitempty"`
+	UpdateAvailable          bool           `json:"update_available"`
+	Mandatory                bool           `json:"mandatory"`
+	HeartbeatIntervalSeconds int            `json:"heartbeat_interval_seconds"`
+	OpenInBrowser            bool           `json:"open_in_browser"`
+	DeliveryMethod           string         `json:"delivery_method"`
+	ReleaseID                string         `json:"release_id"`
+	Version                  string         `json:"version"`
+	Notes                    string         `json:"notes"`
+	DownloadURL              string         `json:"download_url"`
+	ChecksumSHA256           string         `json:"checksum_sha256"`
+	Signature                string         `json:"signature"`
+	Size                     int64          `json:"size"`
+	RollbackAllowed          bool           `json:"rollback_allowed"`
+	Maintenance              *Maintenance   `json:"maintenance,omitempty"`
+	Authz                    *AuthzEnvelope `json:"authz,omitempty"`
 }
 
 type Maintenance struct {
@@ -141,13 +153,15 @@ func (h *UpdateWatchHandle) Stop() {
 
 func New(baseURL, appID, appSecret string) *Client {
 	return &Client{
-		BaseURL:    baseURL,
-		AppID:      appID,
-		AppSecret:  appSecret,
-		Attributes: map[string]interface{}{},
-		Retries:    2,
-		Backoff:    500 * time.Millisecond,
-		HTTPClient: &http.Client{Timeout: 30 * time.Second},
+		BaseURL:               baseURL,
+		AppID:                 appID,
+		AppSecret:             appSecret,
+		Attributes:            map[string]interface{}{},
+		AuthzPublicKeys:       map[string]string{},
+		AuthzClockSkewSeconds: 120,
+		Retries:               2,
+		Backoff:               500 * time.Millisecond,
+		HTTPClient:            &http.Client{Timeout: 30 * time.Second},
 	}
 }
 

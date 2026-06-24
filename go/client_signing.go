@@ -7,13 +7,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/google/uuid"
 	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
-	"github.com/google/uuid"
 )
 
 func canonicalQuery(raw url.Values) string {
@@ -76,7 +76,9 @@ func extractJWTSubject(token string) string {
 	return ""
 }
 
-func (c *Client) signRequestHeaders(req *http.Request, body []byte, secret string, identity string, includeAppID bool) {
+// signRequestHeaders signs the request and returns the nonce it used, so callers
+// can verify a server response (authz verdict) is bound to this exact challenge.
+func (c *Client) signRequestHeaders(req *http.Request, body []byte, secret string, identity string, includeAppID bool) string {
 	now := time.Now().Unix()
 	nonce := uuid.NewString()
 	canonical := strings.Join([]string{
@@ -96,6 +98,7 @@ func (c *Client) signRequestHeaders(req *http.Request, body []byte, secret strin
 	if includeAppID {
 		req.Header.Set(signHeaderAppID, c.AppID)
 	}
+	return nonce
 }
 
 func (c *Client) signAuthRequestHeaders(req *http.Request, body []byte) error {
@@ -106,4 +109,3 @@ func (c *Client) signAuthRequestHeaders(req *http.Request, body []byte) error {
 	c.signRequestHeaders(req, body, c.AuthToken, sub, false)
 	return nil
 }
-

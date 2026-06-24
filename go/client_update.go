@@ -18,7 +18,7 @@ func (c *Client) CheckUpdate(ctx context.Context, currentVersion string, version
 		Attributes:     c.Attributes,
 	}
 	body, _ := json.Marshal(req)
-	resp, err := c.doRequest(ctx, http.MethodPost, "/api/client/update-check", body)
+	resp, nonce, err := c.doRequestCapturingNonce(ctx, http.MethodPost, "/api/client/update-check", body)
 	if err != nil {
 		return UpdateCheckResponse{}, err
 	}
@@ -28,6 +28,11 @@ func (c *Client) CheckUpdate(ctx context.Context, currentVersion string, version
 	}
 	var out UpdateCheckResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return UpdateCheckResponse{}, err
+	}
+	// Fail closed: when RequireAuthz, the response must carry a valid signed
+	// "allow" bound to this request's nonce and device.
+	if err := c.verifyAuthz(out.Authz, nonce); err != nil {
 		return UpdateCheckResponse{}, err
 	}
 	if c.VerifySignature && out.Signature != "" && out.ChecksumSHA256 != "" {

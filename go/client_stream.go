@@ -92,6 +92,12 @@ func (c *Client) consumeUpdateStream(ctx context.Context, options UpdateStreamOp
 		if errors.Is(err, ErrDeviceBlocked) {
 			return
 		}
+		// A failed/denied authorization verdict means the server is fake or this
+		// device is revoked — stop, don't reconnect.
+		var authzErr *AuthzError
+		if errors.As(err, &authzErr) {
+			return
+		}
 		if status == http.StatusUnauthorized || status == http.StatusForbidden {
 			return
 		}
@@ -137,7 +143,7 @@ func (c *Client) connectAndReadSSE(ctx context.Context, options UpdateStreamOpti
 	if err != nil {
 		return 0, err
 	}
-	c.signRequestHeaders(req, nil, c.AppSecret, c.AppID, true)
+	nonce := c.signRequestHeaders(req, nil, c.AppSecret, c.AppID, true)
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return 0, err
@@ -153,6 +159,9 @@ func (c *Client) connectAndReadSSE(ctx context.Context, options UpdateStreamOpti
 	eventName := ""
 	eventID := ""
 	var dataLines []string
+	// When RequireAuthz, ignore pushed events until the stream proves it comes
+	// from the real server via a valid signed authz event.
+	authzOK := !c.RequireAuthz
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, ":") {
@@ -167,7 +176,18 @@ func (c *Client) connectAndReadSSE(ctx context.Context, options UpdateStreamOpti
 				eventName = "message"
 			}
 			payload := strings.Join(dataLines, "\n")
-			if eventName != "connected" && payload != "" {
+			if eventName == "authz" {
+				if c.RequireAuthz {
+					var env AuthzEnvelope
+					if err := json.Unmarshal([]byte(payload), &env); err != nil {
+						return resp.StatusCode, &AuthzError{APIErrorCodeAuthzInvalid, "authorization malformed"}
+					}
+					if err := c.verifyAuthz(&env, nonce); err != nil {
+						return resp.StatusCode, err
+					}
+					authzOK = true
+				}
+			} else if eventName != "connected" && payload != "" && authzOK {
 				var evt UpdatePushEvent
 				if err := json.Unmarshal([]byte(payload), &evt); err == nil {
 					if evt.ID == "" {

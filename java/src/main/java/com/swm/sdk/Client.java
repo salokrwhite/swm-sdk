@@ -50,6 +50,8 @@ public class Client {
     public static final String API_ERROR_CODE_DEVICE_BLOCKED = "device_blocked";
     public static final String API_ERROR_CODE_UPDATE_REGION_BLOCKED = "update_region_blocked";
     public static final String API_ERROR_CODE_FEEDBACK_DISABLED = "feedback_disabled";
+    public static final String API_ERROR_CODE_AUTHZ_INVALID = "authz_invalid";
+    public static final String API_ERROR_CODE_AUTHZ_DENIED = "authz_denied";
 
     private static final String SIGN_HEADER_APP_ID = "X-App-Id";
     private static final String SIGN_HEADER_TIMESTAMP = "X-Timestamp";
@@ -78,8 +80,15 @@ public class Client {
     private Map<String, Object> attributes = new LinkedHashMap<>();
     private String publicKey = "";
     private boolean verifySignature;
+    private boolean requireAuthz;
+    private final Map<String, String> authzPublicKeys = new LinkedHashMap<>();
+    private int authzClockSkewSeconds = 120;
     private int retries = 2;
     private Duration backoff = Duration.ofMillis(500);
+
+    // Returned by the client-signed request path so callers can verify a server
+    // response (authz verdict) is bound to the exact nonce that was sent.
+    private record ClientResponse(String body, String nonce) {}
 
     public Client(String baseUrl, String appId, String appSecret) {
         this(baseUrl, appId, appSecret, HttpClient.newBuilder()
@@ -120,6 +129,11 @@ public class Client {
     public void setRetries(int retries) { this.retries = retries; }
     public Duration getBackoff() { return backoff; }
     public void setBackoff(Duration backoff) { this.backoff = backoff; }
+    public boolean isRequireAuthz() { return requireAuthz; }
+    public void setRequireAuthz(boolean requireAuthz) { this.requireAuthz = requireAuthz; }
+    public Map<String, String> getAuthzPublicKeys() { return authzPublicKeys; }
+    public int getAuthzClockSkewSeconds() { return authzClockSkewSeconds; }
+    public void setAuthzClockSkewSeconds(int authzClockSkewSeconds) { this.authzClockSkewSeconds = authzClockSkewSeconds; }
 
     public UpdateCheckResponse checkUpdate(String currentVersion, Integer versionCode) {
         UpdateCheckRequest payload = new UpdateCheckRequest()
@@ -131,7 +145,11 @@ public class Client {
                 .setDeviceId(deviceId)
                 .setUserId(userId)
                 .setAttributes(attributes);
-        UpdateCheckResponse response = parseJson(doRequest("POST", "/api/client/update-check", jsonBytes(payload), "application/json"), UpdateCheckResponse.class);
+        ClientResponse res = doRequest("POST", "/api/client/update-check", jsonBytes(payload), "application/json");
+        UpdateCheckResponse response = parseJson(res.body(), UpdateCheckResponse.class);
+        // Fail closed: when requireAuthz, the response must carry a valid signed
+        // "allow" bound to this request's nonce and this device.
+        verifyAuthzOrThrow(response.getAuthz(), res.nonce());
         verifyUpdateSignature(response);
         return response;
     }
@@ -144,7 +162,8 @@ public class Client {
                 .setChannelCode(channel)
                 .setProperties(props == null ? new LinkedHashMap<>() : props)
                 .setAttributes(attributes);
-        doRequest("POST", "/api/client/events", jsonBytes(payload), "application/json");
+        ClientResponse res = doRequest("POST", "/api/client/events", jsonBytes(payload), "application/json");
+        verifyResponseAuthz(res.body(), res.nonce());
     }
 
     public void reportHeartbeat(String appVersion) {
@@ -161,11 +180,13 @@ public class Client {
         if (!attributes.isEmpty()) {
             payload.put("attributes", attributes);
         }
-        doRequest("POST", "/api/client/heartbeat", jsonBytes(payload), "application/json");
+        ClientResponse res = doRequest("POST", "/api/client/heartbeat", jsonBytes(payload), "application/json");
+        verifyResponseAuthz(res.body(), res.nonce());
     }
 
     public void reportEvents(List<Event> events) {
-        doRequest("POST", "/api/client/events", jsonBytes(Map.of("events", events)), "application/json");
+        ClientResponse res = doRequest("POST", "/api/client/events", jsonBytes(Map.of("events", events)), "application/json");
+        verifyResponseAuthz(res.body(), res.nonce());
     }
 
     public void reportFeedback(String content, Integer rating, String contact, List<String> attachments, Map<String, Object> metadata) {
@@ -175,7 +196,8 @@ public class Client {
         String boundary = "----swm-" + UUID.randomUUID();
         try {
             byte[] body = buildFeedbackMultipart(boundary, content, rating, contact, attachments, metadata);
-            doRequest("POST", "/api/client/feedback", body, "multipart/form-data; boundary=" + boundary);
+            ClientResponse res = doRequest("POST", "/api/client/feedback", body, "multipart/form-data; boundary=" + boundary);
+            verifyResponseAuthz(res.body(), res.nonce());
         } catch (IOException e) {
             throw new SwmApiException(0, null, e.getMessage());
         }
@@ -357,7 +379,7 @@ public class Client {
         }
     }
 
-    private String doRequest(String method, String path, byte[] body, String contentType) {
+    private ClientResponse doRequest(String method, String path, byte[] body, String contentType) {
         if (isBlank(appId) || isBlank(appSecret)) {
             throw new SwmValidationException(400, null, "app_id and app_secret required");
         }
@@ -368,12 +390,12 @@ public class Client {
                 URI uri = URI.create(baseUrl + path);
                 HttpRequest.Builder builder = HttpRequest.newBuilder(uri).timeout(Duration.ofSeconds(30));
                 applyBody(builder, method, payload, contentType);
-                signClientRequestHeaders(builder, method, uri, payload);
+                String nonce = signClientRequestHeaders(builder, method, uri, payload);
                 HttpResponse<String> resp = send(builder.build(), HttpResponse.BodyHandlers.ofString());
                 if (resp.statusCode() >= 300) {
                     throw mapError(resp.statusCode(), resp.headers(), resp.body());
                 }
-                return resp.body();
+                return new ClientResponse(resp.body(), nonce);
             } catch (SwmApiException ex) {
                 throw ex;
             } catch (RuntimeException ex) {
@@ -458,7 +480,7 @@ public class Client {
         return Duration.ofMillis((long) (backoff.toMillis() * Math.pow(2, attempt)));
     }
 
-    private void signClientRequestHeaders(HttpRequest.Builder builder, String method, URI uri, byte[] body) {
+    private String signClientRequestHeaders(HttpRequest.Builder builder, String method, URI uri, byte[] body) {
         long timestamp = Instant.now().getEpochSecond();
         String nonce = UUID.randomUUID().toString();
         String canonical = buildCanonical(method, uri, body, timestamp, nonce, appId);
@@ -468,6 +490,7 @@ public class Client {
         builder.header(SIGN_HEADER_NONCE, nonce);
         builder.header(SIGN_HEADER_SIGNATURE, signature);
         builder.header(SIGN_HEADER_VERSION, SIGN_VERSION_V1);
+        return nonce;
     }
 
     private void signAuthRequestHeaders(HttpRequest.Builder builder, String method, URI uri, byte[] body) {
@@ -790,6 +813,123 @@ public class Client {
         out.write(("--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
     }
 
+    // verifyResponseAuthz extracts the signed verdict from a response body and
+    // enforces it (no-op when requireAuthz is false). For endpoints whose body is
+    // otherwise ignored (heartbeat / events / feedback).
+    private void verifyResponseAuthz(String body, String requestNonce) {
+        if (!requireAuthz) {
+            return;
+        }
+        AuthzEnvelope env = null;
+        try {
+            JsonNode root = MAPPER.readTree(body);
+            JsonNode authz = root == null ? null : root.get("authz");
+            if (authz != null && authz.isObject()) {
+                env = MAPPER.treeToValue(authz, AuthzEnvelope.class);
+            }
+        } catch (Exception ignore) {
+            // env stays null -> fail closed below
+        }
+        verifyAuthzOrThrow(env, requestNonce);
+    }
+
+    // verifyAuthzOrThrow enforces a server authorization verdict. No-op when
+    // requireAuthz is false. Otherwise the envelope must be present, bound to the
+    // request nonce + this device, unexpired, and signed by an embedded public key
+    // for its key_id, with decision "allow"; any failure throws so the caller fails
+    // closed. Order matters: signature is verified before the decision is honored.
+    private void verifyAuthzOrThrow(AuthzEnvelope env, String requestNonce) {
+        if (!requireAuthz) {
+            return;
+        }
+        if (env == null) {
+            throw new SwmUnauthorizedException(401, API_ERROR_CODE_AUTHZ_INVALID, "authorization missing");
+        }
+        if (isBlank(requestNonce) || !requestNonce.equals(env.getNonce())) {
+            throw new SwmUnauthorizedException(401, API_ERROR_CODE_AUTHZ_INVALID, "authorization nonce mismatch");
+        }
+        if (!nullToEmpty(env.getDeviceId()).equals(nullToEmpty(deviceId))) {
+            throw new SwmUnauthorizedException(401, API_ERROR_CODE_AUTHZ_INVALID, "authorization device mismatch");
+        }
+        long now = Instant.now().getEpochSecond();
+        if (env.getExpiresAt() <= 0 || now > env.getExpiresAt() + authzClockSkewSeconds) {
+            throw new SwmUnauthorizedException(401, API_ERROR_CODE_AUTHZ_INVALID, "authorization expired");
+        }
+        String keyId = env.getKeyId() == null ? "" : env.getKeyId();
+        String pubEncoded = authzPublicKeys.get(keyId);
+        if (isBlank(pubEncoded)) {
+            throw new SwmUnauthorizedException(401, API_ERROR_CODE_AUTHZ_INVALID, "authorization key unknown: " + keyId);
+        }
+        if (isBlank(env.getSignature())) {
+            throw new SwmUnauthorizedException(401, API_ERROR_CODE_AUTHZ_INVALID, "authorization signature missing");
+        }
+        byte[] pubBytes = decodeKeyMaterial(pubEncoded);
+        if (pubBytes.length != 32) {
+            throw new SwmUnauthorizedException(401, API_ERROR_CODE_AUTHZ_INVALID, "authorization public key invalid");
+        }
+        byte[] sigBytes = decodeKeyMaterial(env.getSignature());
+        byte[] msg = buildAuthzCanonical(appId, env).getBytes(StandardCharsets.UTF_8);
+        boolean ok;
+        try {
+            Ed25519Signer verifier = new Ed25519Signer();
+            verifier.init(false, new Ed25519PublicKeyParameters(pubBytes, 0));
+            verifier.update(msg, 0, msg.length);
+            ok = verifier.verifySignature(sigBytes);
+        } catch (RuntimeException ex) {
+            throw new SwmUnauthorizedException(401, API_ERROR_CODE_AUTHZ_INVALID, "authorization verify error: " + ex.getMessage());
+        }
+        if (!ok) {
+            throw new SwmUnauthorizedException(401, API_ERROR_CODE_AUTHZ_INVALID, "authorization signature invalid");
+        }
+        if (!"allow".equals(env.getDecision())) {
+            String reason = isBlank(env.getReason()) ? "access denied" : env.getReason();
+            throw new SwmUnauthorizedException(403, API_ERROR_CODE_AUTHZ_DENIED, "authorization denied: " + reason);
+        }
+    }
+
+    // Must match backend internal/auth/authz.go authzCanonical byte-for-byte.
+    private static String buildAuthzCanonical(String appId, AuthzEnvelope env) {
+        return String.join("\n",
+                "authz_v1",
+                "app_id:" + appId,
+                "device_id:" + nullToEmpty(env.getDeviceId()),
+                "nonce:" + nullToEmpty(env.getNonce()),
+                "decision:" + nullToEmpty(env.getDecision()),
+                "reason:" + nullToEmpty(env.getReason()),
+                "issued_at:" + env.getIssuedAt(),
+                "expires_at:" + env.getExpiresAt(),
+                "key_id:" + nullToEmpty(env.getKeyId()));
+    }
+
+    // decodeKeyMaterial decodes hex (preferred when all-hex and even length) or
+    // base64. Hex-first matches the server's hex public keys; the base64 signature
+    // (which contains non-hex chars) falls through to base64.
+    private static byte[] decodeKeyMaterial(String value) {
+        String v = value == null ? "" : value.trim();
+        if (v.isEmpty()) {
+            throw new SwmApiException(0, null, "empty key material");
+        }
+        if (v.length() % 2 == 0 && isAllHex(v)) {
+            return HexFormat.of().parseHex(v);
+        }
+        return Base64.getDecoder().decode(v);
+    }
+
+    private static boolean isAllHex(String s) {
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+            boolean hex = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+            if (!hex) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String nullToEmpty(String value) {
+        return value == null ? "" : value;
+    }
+
     private void verifyUpdateSignature(UpdateCheckResponse response) {
         if (response == null || !verifySignature) {
             return;
@@ -860,11 +1000,14 @@ public class Client {
                 .GET()
                 .header("Accept", "text/event-stream")
                 .timeout(Duration.ofMinutes(60));
-        signClientRequestHeaders(builder, "GET", uri, new byte[0]);
+        String streamNonce = signClientRequestHeaders(builder, "GET", uri, new byte[0]);
         HttpResponse<InputStream> resp = send(builder.build(), HttpResponse.BodyHandlers.ofInputStream());
         if (resp.statusCode() >= 300) {
             throw mapError(resp.statusCode(), resp.headers(), readErrorBody(resp.body()));
         }
+        // When requireAuthz, ignore pushed events until the stream proves it comes
+        // from the real server via a valid signed authz event.
+        boolean[] authzOk = { !requireAuthz };
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(resp.body(), StandardCharsets.UTF_8))) {
             String eventName = "";
             String eventId = "";
@@ -878,7 +1021,7 @@ public class Client {
                     continue;
                 }
                 if (line.isEmpty()) {
-                    flushSseMessage(options, eventName, eventId, data.toString(), onEvent);
+                    flushSseMessage(options, eventName, eventId, data.toString(), onEvent, streamNonce, authzOk);
                     eventName = "";
                     eventId = "";
                     data.setLength(0);
@@ -900,8 +1043,27 @@ public class Client {
         }
     }
 
-    private void flushSseMessage(UpdateStreamOptions options, String eventName, String eventId, String data, Consumer<UpdatePushEvent> onEvent) {
+    private void flushSseMessage(UpdateStreamOptions options, String eventName, String eventId, String data, Consumer<UpdatePushEvent> onEvent, String requestNonce, boolean[] authzOk) {
         if (isBlank(data) || "connected".equalsIgnoreCase(eventName)) {
+            return;
+        }
+        // The server emits a signed authz verdict as the first event. When
+        // requireAuthz, verify it (throws to fail closed) before trusting any
+        // pushed event; ignore everything until it is verified.
+        if ("authz".equalsIgnoreCase(eventName)) {
+            if (requireAuthz) {
+                AuthzEnvelope env;
+                try {
+                    env = MAPPER.readValue(data, AuthzEnvelope.class);
+                } catch (IOException e) {
+                    throw new SwmUnauthorizedException(401, API_ERROR_CODE_AUTHZ_INVALID, "authorization malformed");
+                }
+                verifyAuthzOrThrow(env, requestNonce);
+                authzOk[0] = true;
+            }
+            return;
+        }
+        if (!authzOk[0]) {
             return;
         }
         UpdatePushEvent event;

@@ -143,7 +143,9 @@ public partial class Client
         request.Headers.TryAddWithoutValidation(SignHeaderVersion, SignVersion);
     }
 
-    private void SignClientRequest(HttpRequestMessage request, byte[] bodyBytes)
+    // SignClientRequest signs the request and returns the nonce it used, so callers
+    // can verify a server response (authz verdict) is bound to this challenge.
+    private string SignClientRequest(HttpRequestMessage request, byte[] bodyBytes)
     {
         var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var nonce = Guid.NewGuid().ToString();
@@ -151,6 +153,7 @@ public partial class Client
         var signature = HmacSHA256Hex(AppSecret, canonical);
         request.Headers.TryAddWithoutValidation(SignHeaderAppId, AppId);
         SetCommonSignatureHeaders(request, timestamp, nonce, signature);
+        return nonce;
     }
 
     private void SignAuthRequest(HttpRequestMessage request, byte[] bodyBytes, string rawToken)

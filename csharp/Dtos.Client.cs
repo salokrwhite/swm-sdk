@@ -76,6 +76,42 @@ public sealed class UpdateCheckResponse
 
     [JsonPropertyName("maintenance")]
     public Maintenance? Maintenance { get; set; }
+
+    [JsonPropertyName("authz")]
+    public AuthzEnvelope? Authz { get; set; }
+}
+
+/// <summary>
+/// Device-bound authorization verdict signed by the server with an Ed25519 key.
+/// The client MUST verify it (signature + nonce + device + expiry + decision)
+/// before trusting the response. A fake/offline server cannot forge it because
+/// the private key never ships with the client.
+/// </summary>
+public sealed class AuthzEnvelope
+{
+    [JsonPropertyName("decision")]
+    public string? Decision { get; set; }
+
+    [JsonPropertyName("nonce")]
+    public string? Nonce { get; set; }
+
+    [JsonPropertyName("device_id")]
+    public string? DeviceId { get; set; }
+
+    [JsonPropertyName("issued_at")]
+    public long IssuedAt { get; set; }
+
+    [JsonPropertyName("expires_at")]
+    public long ExpiresAt { get; set; }
+
+    [JsonPropertyName("key_id")]
+    public string? KeyId { get; set; }
+
+    [JsonPropertyName("reason")]
+    public string? Reason { get; set; }
+
+    [JsonPropertyName("signature")]
+    public string? Signature { get; set; }
 }
 
 public sealed class Maintenance
@@ -233,4 +269,12 @@ internal sealed class GenericOkResponse
 {
     [JsonExtensionData]
     public Dictionary<string, JsonElement>? Data { get; set; }
+}
+
+// AuthzCarrier extracts just the signed verdict from responses whose body is
+// otherwise ignored (heartbeat/events/feedback).
+internal sealed class AuthzCarrier
+{
+    [JsonPropertyName("authz")]
+    public AuthzEnvelope? Authz { get; set; }
 }

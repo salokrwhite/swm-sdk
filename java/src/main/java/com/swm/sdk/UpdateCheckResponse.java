@@ -45,12 +45,19 @@ public final class UpdateCheckResponse {
     @JsonProperty("maintenance")
     private Maintenance maintenance;
 
+    @JsonProperty("authz")
+    private AuthzEnvelope authz;
+
     public boolean isUpdateAvailable() {
         return updateAvailable;
     }
 
     public Maintenance getMaintenance() {
         return maintenance;
+    }
+
+    public AuthzEnvelope getAuthz() {
+        return authz;
     }
 
     public boolean isMandatory() {

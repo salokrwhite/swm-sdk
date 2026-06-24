@@ -121,6 +121,15 @@ public partial class Client
 
     private async Task<HttpResponseMessage> DoRequestAsync(HttpMethod method, string path, HttpContent? body = null, CancellationToken cancellationToken = default)
     {
+        var (resp, _) = await DoRequestCapturingNonceAsync(method, path, body, cancellationToken).ConfigureAwait(false);
+        return resp;
+    }
+
+    // DoRequestCapturingNonceAsync is identical to DoRequestAsync but also returns
+    // the X-Nonce that was actually sent on the successful attempt, so callers can
+    // verify a server response is cryptographically bound to that challenge.
+    private async Task<(HttpResponseMessage Response, string Nonce)> DoRequestCapturingNonceAsync(HttpMethod method, string path, HttpContent? body, CancellationToken cancellationToken)
+    {
         if (string.IsNullOrWhiteSpace(AppId) || string.IsNullOrWhiteSpace(AppSecret))
         {
             throw new SwmValidationException(400, null, "app_id and app_secret required");
@@ -142,9 +151,9 @@ public partial class Client
                     }
                     req.Content = clone;
                 }
-                SignClientRequest(req, bodyBytes);
+                var nonce = SignClientRequest(req, bodyBytes);
                 var resp = await HttpClient.SendAsync(req, cancellationToken).ConfigureAwait(false);
-                return resp;
+                return (resp, nonce);
             }
             catch (Exception ex)
             {
@@ -219,17 +228,25 @@ public partial class Client
             UserId = string.IsNullOrWhiteSpace(effectiveUserId) ? null : effectiveUserId,
             Attributes = JsonDefaults.ToJsonElementMap(Attributes)
         };
-        using var res = await DoRequestAsync(HttpMethod.Post, "/api/client/update-check", JsonDefaults.ToJsonContent(payload, SwmJsonContext.Default.UpdateCheckRequest), cancellationToken).ConfigureAwait(false);
-        await SwmErrorParser.ThrowIfErrorAsync(res, cancellationToken).ConfigureAwait(false);
-        var data = await JsonDefaults.DeserializeAsync(res.Content, SwmJsonContext.Default.UpdateCheckResponse, cancellationToken).ConfigureAwait(false);
-        if (!string.IsNullOrWhiteSpace(data.Signature) && !string.IsNullOrWhiteSpace(data.ChecksumSha256))
+        var (res, requestNonce) = await DoRequestCapturingNonceAsync(HttpMethod.Post, "/api/client/update-check", JsonDefaults.ToJsonContent(payload, SwmJsonContext.Default.UpdateCheckRequest), cancellationToken).ConfigureAwait(false);
+        using (res)
         {
-            if (!VerifySignatureInternal(data.ChecksumSha256!, data.Signature!))
+            await SwmErrorParser.ThrowIfErrorAsync(res, cancellationToken).ConfigureAwait(false);
+            var data = await JsonDefaults.DeserializeAsync(res.Content, SwmJsonContext.Default.UpdateCheckResponse, cancellationToken).ConfigureAwait(false);
+
+            // Fail closed: when RequireAuthz, the response must carry a valid signed
+            // "allow" bound to this request's nonce and this device.
+            VerifyAuthzOrThrow(data.Authz, requestNonce);
+
+            if (!string.IsNullOrWhiteSpace(data.Signature) && !string.IsNullOrWhiteSpace(data.ChecksumSha256))
             {
-                throw new SwmApiException(0, null, "signature verification failed");
+                if (!VerifySignatureInternal(data.ChecksumSha256!, data.Signature!))
+                {
+                    throw new SwmApiException(0, null, "signature verification failed");
+                }
             }
+            return data;
         }
-        return data;
     }
 
     public async Task ReportEventAsync(string eventName, Dictionary<string, object?>? properties = null, CancellationToken cancellationToken = default)
@@ -243,8 +260,12 @@ public partial class Client
             Properties = properties != null ? JsonDefaults.ToJsonElementMap(properties) : new Dictionary<string, JsonElement>(),
             Attributes = JsonDefaults.ToJsonElementMap(Attributes)
         };
-        using var res = await DoRequestAsync(HttpMethod.Post, "/api/client/events", JsonDefaults.ToJsonContent(payload, SwmJsonContext.Default.EventIngestItem), cancellationToken).ConfigureAwait(false);
-        await SwmErrorParser.ThrowIfErrorAsync(res, cancellationToken).ConfigureAwait(false);
+        var (res, nonce) = await DoRequestCapturingNonceAsync(HttpMethod.Post, "/api/client/events", JsonDefaults.ToJsonContent(payload, SwmJsonContext.Default.EventIngestItem), cancellationToken).ConfigureAwait(false);
+        using (res)
+        {
+            await SwmErrorParser.ThrowIfErrorAsync(res, cancellationToken).ConfigureAwait(false);
+            await VerifyResponseAuthzAsync(res, nonce, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     public async Task ReportEventsAsync(List<EventIngestItem> events, CancellationToken cancellationToken = default)
@@ -253,8 +274,12 @@ public partial class Client
         {
             Events = events
         };
-        using var res = await DoRequestAsync(HttpMethod.Post, "/api/client/events", JsonDefaults.ToJsonContent(payload, SwmJsonContext.Default.EventBatchRequest), cancellationToken).ConfigureAwait(false);
-        await SwmErrorParser.ThrowIfErrorAsync(res, cancellationToken).ConfigureAwait(false);
+        var (res, nonce) = await DoRequestCapturingNonceAsync(HttpMethod.Post, "/api/client/events", JsonDefaults.ToJsonContent(payload, SwmJsonContext.Default.EventBatchRequest), cancellationToken).ConfigureAwait(false);
+        using (res)
+        {
+            await SwmErrorParser.ThrowIfErrorAsync(res, cancellationToken).ConfigureAwait(false);
+            await VerifyResponseAuthzAsync(res, nonce, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     public async Task ReportHeartbeatAsync(string? appVersion = null, string? userId = null, CancellationToken cancellationToken = default)
@@ -275,8 +300,12 @@ public partial class Client
             Attributes = Attributes.Count > 0 ? JsonDefaults.ToJsonElementMap(Attributes) : null
         };
 
-        using var res = await DoRequestAsync(HttpMethod.Post, "/api/client/heartbeat", JsonDefaults.ToJsonContent(payload, SwmJsonContext.Default.HeartbeatRequest), cancellationToken).ConfigureAwait(false);
-        await SwmErrorParser.ThrowIfErrorAsync(res, cancellationToken).ConfigureAwait(false);
+        var (res, nonce) = await DoRequestCapturingNonceAsync(HttpMethod.Post, "/api/client/heartbeat", JsonDefaults.ToJsonContent(payload, SwmJsonContext.Default.HeartbeatRequest), cancellationToken).ConfigureAwait(false);
+        using (res)
+        {
+            await SwmErrorParser.ThrowIfErrorAsync(res, cancellationToken).ConfigureAwait(false);
+            await VerifyResponseAuthzAsync(res, nonce, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     public async Task ReportFeedbackAsync(string content, int? rating = null, string? contact = null, IEnumerable<string>? attachments = null, Dictionary<string, object?>? metadata = null, CancellationToken cancellationToken = default)
@@ -290,8 +319,12 @@ public partial class Client
         using var form = formResult.Form;
         try
         {
-            using var res = await DoRequestAsync(HttpMethod.Post, "/api/client/feedback", form, cancellationToken).ConfigureAwait(false);
-            await SwmErrorParser.ThrowIfErrorAsync(res, cancellationToken).ConfigureAwait(false);
+            var (res, nonce) = await DoRequestCapturingNonceAsync(HttpMethod.Post, "/api/client/feedback", form, cancellationToken).ConfigureAwait(false);
+            using (res)
+            {
+                await SwmErrorParser.ThrowIfErrorAsync(res, cancellationToken).ConfigureAwait(false);
+                await VerifyResponseAuthzAsync(res, nonce, cancellationToken).ConfigureAwait(false);
+            }
         }
         finally
         {
