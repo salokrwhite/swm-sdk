@@ -4,6 +4,7 @@
 #include <functional>
 #include <optional>
 #include <vector>
+#include <map>
 #include <memory>
 #include <atomic>
 #include <thread>
@@ -12,10 +13,33 @@
 
 namespace swm {
 
+inline constexpr const char* kApiErrorCodeAuthzInvalid = "authz_invalid";
+inline constexpr const char* kApiErrorCodeAuthzDenied = "authz_denied";
+
 class FeedbackDisabledError : public std::runtime_error {
 public:
   explicit FeedbackDisabledError(const std::string& message = "feedback disabled")
       : std::runtime_error(message) {}
+};
+
+// Thrown when a required authorization verdict is missing or invalid (fail closed).
+class AuthzError : public std::runtime_error {
+public:
+  AuthzError(std::string code, const std::string& message)
+      : std::runtime_error(code + ": " + message), code(std::move(code)) {}
+  std::string code;
+};
+
+// Device-bound authorization verdict signed by the server with an Ed25519 key.
+struct AuthzEnvelope {
+  std::string decision;
+  std::string nonce;
+  std::string device_id;
+  long long issued_at = 0;
+  long long expires_at = 0;
+  std::string key_id;
+  std::string reason;
+  std::string signature;
 };
 
 inline constexpr const char* kControlEventShutdown = "device_shutdown";
@@ -43,6 +67,7 @@ struct UpdateCheckResponse {
   bool rollback_allowed = false;
   std::string release_notes_url;
   std::optional<Maintenance> maintenance;
+  std::optional<AuthzEnvelope> authz;
 };
 
 struct UpdatePushEvent {
@@ -89,7 +114,7 @@ private:
 
 class Client {
 public:
-  Client(std::string base_url, std::string app_key);
+  Client(std::string base_url, std::string app_id, std::string app_secret);
 
   std::string channel;
   std::string platform;
@@ -99,6 +124,12 @@ public:
   int retries = 2;
   int backoff_ms = 500;
   std::function<bool(const std::string&, const std::string&)> signature_verifier;
+  // When true, every call that can carry a signed verdict fails closed unless the
+  // response has a valid Ed25519 "allow" bound to this request + device.
+  bool require_authz = false;
+  // key_id -> Ed25519 public key (hex or base64).
+  std::map<std::string, std::string> authz_public_keys;
+  int authz_clock_skew_seconds = 120;
 
   UpdateCheckResponse check_update(const std::string& current_version, const std::optional<int>& version_code = std::nullopt);
   void report_event(const std::string& event_name, const nlohmann::json& properties = nlohmann::json::object());
@@ -115,7 +146,8 @@ public:
 
 private:
   std::string base_url_;
-  std::string app_key_;
+  std::string app_id_;
+  std::string app_secret_;
 };
 
 } 

@@ -17,8 +17,11 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(cpr nlohmann_json)
 
+# OpenSSL provides Ed25519 verification (authz verdicts) via EVP.
+find_package(OpenSSL REQUIRED)
+
 add_library(swm_sdk src/client.cpp)
 
 target_include_directories(swm_sdk PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-target_link_libraries(swm_sdk PUBLIC cpr::cpr nlohmann_json::nlohmann_json)
+target_link_libraries(swm_sdk PUBLIC cpr::cpr nlohmann_json::nlohmann_json OpenSSL::Crypto)

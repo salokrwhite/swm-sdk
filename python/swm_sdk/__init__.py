@@ -1,7 +1,11 @@
 from .client import (
+    API_ERROR_CODE_AUTHZ_DENIED,
+    API_ERROR_CODE_AUTHZ_INVALID,
     CONTROL_EVENT_MAINTENANCE_CANCELLED,
     CONTROL_EVENT_MAINTENANCE_SCHEDULED,
     CONTROL_EVENT_SHUTDOWN,
+    AuthzEnvelope,
+    AuthzError,
     Client,
     FeedbackDisabledError,
     Maintenance,
@@ -14,6 +18,8 @@ from .client import (
 __all__ = [
     "Client",
     "FeedbackDisabledError",
+    "AuthzError",
+    "AuthzEnvelope",
     "Maintenance",
     "UpdateCheckResponse",
     "UpdatePushEvent",
@@ -22,4 +28,6 @@ __all__ = [
     "CONTROL_EVENT_SHUTDOWN",
     "CONTROL_EVENT_MAINTENANCE_SCHEDULED",
     "CONTROL_EVENT_MAINTENANCE_CANCELLED",
+    "API_ERROR_CODE_AUTHZ_INVALID",
+    "API_ERROR_CODE_AUTHZ_DENIED",
 ]

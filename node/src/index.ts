@@ -1,13 +1,26 @@
 import fetch from 'node-fetch'
 import * as fs from 'fs'
 import * as path from 'path'
-import { createHash, createPublicKey, verify } from 'crypto'
+import { createHash, createHmac, createPublicKey, randomUUID, verify } from 'crypto'
 import FormData from 'form-data'
 
 export class FeedbackDisabledError extends Error {
   constructor(message = 'feedback disabled') {
     super(message)
     this.name = 'FeedbackDisabledError'
+  }
+}
+
+export const API_ERROR_CODE_AUTHZ_INVALID = 'authz_invalid'
+export const API_ERROR_CODE_AUTHZ_DENIED = 'authz_denied'
+
+/** Thrown when a required authorization verdict is missing or invalid (fail closed). */
+export class AuthzError extends Error {
+  code: string
+  constructor(code: string, message: string) {
+    super(message)
+    this.name = 'AuthzError'
+    this.code = code
   }
 }
 
@@ -39,6 +52,17 @@ export interface Maintenance {
   active: boolean
 }
 
+export interface AuthzEnvelope {
+  decision?: string
+  nonce?: string
+  device_id?: string
+  issued_at?: number
+  expires_at?: number
+  key_id?: string
+  reason?: string
+  signature?: string
+}
+
 export interface UpdateCheckResponse {
   update_available: boolean
   mandatory: boolean
@@ -53,6 +77,7 @@ export interface UpdateCheckResponse {
   rollback_allowed?: boolean
   release_notes_url?: string
   maintenance?: Maintenance
+  authz?: AuthzEnvelope
 }
 
 export interface UpdatePushEvent {
@@ -88,9 +113,61 @@ export interface UpdateWatchHandle {
   stop: () => void
 }
 
+// RFC3986 escape matching the backend (Go url.QueryEscape + '+'->'%20', '*'->'%2A').
+function escapeRfc3986(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase())
+}
+
+// Canonical query string: pairs sorted by key then value, RFC3986-escaped, joined '&'.
+function canonicalQuery(pairs: Array<[string, string]>): string {
+  const sorted = pairs
+    .slice()
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0))
+  return sorted.map(([k, v]) => `${escapeRfc3986(k)}=${escapeRfc3986(v)}`).join('&')
+}
+
+function sha256Hex(data: Buffer): string {
+  return createHash('sha256').update(data).digest('hex')
+}
+
+function hmacSha256Hex(secret: string, canonical: string): string {
+  return createHmac('sha256', secret).update(canonical, 'utf8').digest('hex')
+}
+
+function decodeKeyMaterial(value: string): Buffer {
+  const trimmed = value.trim()
+  const isHex = trimmed.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(trimmed)
+  return isHex ? Buffer.from(trimmed, 'hex') : Buffer.from(trimmed, 'base64')
+}
+
+// Must match backend internal/auth/authz.go authzCanonical byte-for-byte.
+function authzCanonical(appId: string, env: AuthzEnvelope): string {
+  return [
+    'authz_v1',
+    'app_id:' + appId,
+    'device_id:' + (env.device_id ?? ''),
+    'nonce:' + (env.nonce ?? ''),
+    'decision:' + (env.decision ?? ''),
+    'reason:' + (env.reason ?? ''),
+    'issued_at:' + String(env.issued_at ?? 0),
+    'expires_at:' + String(env.expires_at ?? 0),
+    'key_id:' + (env.key_id ?? '')
+  ].join('\n')
+}
+
+// SPKI DER prefix for an Ed25519 public key; raw 32-byte key appended.
+const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex')
+
+function ed25519Verify(pubRaw: Buffer, message: Buffer, signature: Buffer): boolean {
+  const der = Buffer.concat([ED25519_SPKI_PREFIX, pubRaw])
+  const key = createPublicKey({ key: der, format: 'der', type: 'spki' })
+  return verify(null, message, key, signature)
+}
+
 export class Client {
   baseUrl: string
-  appKey: string
+  appId: string
+  appSecret: string
   channel = ''
   platform = ''
   arch = ''
@@ -100,10 +177,89 @@ export class Client {
   backoffMs = 500
   publicKey = ''
   verifySignature = false
+  // When true, every call that can carry a signed verdict fails closed unless the
+  // response is accompanied by a valid Ed25519 "allow" bound to this request + device.
+  requireAuthz = false
+  // key_id -> Ed25519 public key (hex or base64).
+  authzPublicKeys: Record<string, string> = {}
+  authzClockSkewSeconds = 120
 
-  constructor(baseUrl: string, appKey: string) {
-    this.baseUrl = baseUrl
-    this.appKey = appKey
+  constructor(baseUrl: string, appId: string, appSecret: string) {
+    this.baseUrl = baseUrl.replace(/\/+$/, '')
+    this.appId = appId
+    this.appSecret = appSecret
+  }
+
+  private signHeaders(method: string, pathname: string, canonicalQ: string, body: Buffer): { headers: Record<string, string>; nonce: string } {
+    const ts = Math.floor(Date.now() / 1000).toString()
+    const nonce = randomUUID()
+    const canonical = [method.toUpperCase(), pathname, canonicalQ, sha256Hex(body), ts, nonce, this.appId].join('\n')
+    const signature = hmacSha256Hex(this.appSecret, canonical)
+    return {
+      headers: {
+        'X-App-Id': this.appId,
+        'X-Timestamp': ts,
+        'X-Nonce': nonce,
+        'X-Signature': signature,
+        'X-Sign-Version': 'v1'
+      },
+      nonce
+    }
+  }
+
+  // verifyAuthz enforces a server verdict. No-op when requireAuthz is false.
+  // Throws AuthzError on any failure so callers fail closed.
+  private verifyAuthz(env: AuthzEnvelope | undefined | null, requestNonce: string): void {
+    if (!this.requireAuthz) return
+    if (!env) throw new AuthzError(API_ERROR_CODE_AUTHZ_INVALID, 'authorization missing')
+    if (!requestNonce || env.nonce !== requestNonce) {
+      throw new AuthzError(API_ERROR_CODE_AUTHZ_INVALID, 'authorization nonce mismatch')
+    }
+    if ((env.device_id ?? '') !== (this.deviceId ?? '')) {
+      throw new AuthzError(API_ERROR_CODE_AUTHZ_INVALID, 'authorization device mismatch')
+    }
+    const skew = this.authzClockSkewSeconds > 0 ? this.authzClockSkewSeconds : 120
+    const now = Math.floor(Date.now() / 1000)
+    const exp = env.expires_at ?? 0
+    if (exp <= 0 || now > exp + skew) {
+      throw new AuthzError(API_ERROR_CODE_AUTHZ_INVALID, 'authorization expired')
+    }
+    const keyId = env.key_id ?? ''
+    const pubEncoded = this.authzPublicKeys[keyId]
+    if (!pubEncoded || !pubEncoded.trim()) {
+      throw new AuthzError(API_ERROR_CODE_AUTHZ_INVALID, `authorization key unknown: ${keyId}`)
+    }
+    if (!env.signature || !env.signature.trim()) {
+      throw new AuthzError(API_ERROR_CODE_AUTHZ_INVALID, 'authorization signature missing')
+    }
+    const pubBytes = decodeKeyMaterial(pubEncoded)
+    if (pubBytes.length !== 32) {
+      throw new AuthzError(API_ERROR_CODE_AUTHZ_INVALID, 'authorization public key invalid')
+    }
+    const sigBytes = decodeKeyMaterial(env.signature)
+    const msg = Buffer.from(authzCanonical(this.appId, env), 'utf8')
+    let ok = false
+    try {
+      ok = ed25519Verify(pubBytes, msg, sigBytes)
+    } catch (e) {
+      throw new AuthzError(API_ERROR_CODE_AUTHZ_INVALID, `authorization verify error: ${(e as Error).message}`)
+    }
+    if (!ok) throw new AuthzError(API_ERROR_CODE_AUTHZ_INVALID, 'authorization signature invalid')
+    if (env.decision !== 'allow') {
+      const reason = env.reason && env.reason.trim() ? env.reason : 'access denied'
+      throw new AuthzError(API_ERROR_CODE_AUTHZ_DENIED, `authorization denied: ${reason}`)
+    }
+  }
+
+  private verifyResponseAuthz(body: string, requestNonce: string): void {
+    if (!this.requireAuthz) return
+    let env: AuthzEnvelope | undefined
+    try {
+      env = (JSON.parse(body) as { authz?: AuthzEnvelope })?.authz
+    } catch {
+      env = undefined
+    }
+    this.verifyAuthz(env, requestNonce)
   }
 
   startUpdateStream(options: UpdateStreamOptions, onEvent: (event: UpdatePushEvent) => void): UpdateWatchHandle {
@@ -129,18 +285,20 @@ export class Client {
       while (!stopped) {
         try {
           controller = new AbortController()
-          const qs = new URLSearchParams({
-            app_key: this.appKey,
-            channel_code: channel,
-            platform,
-            arch,
-            device_id: deviceId
-          })
-          if (options.current_version) qs.set('current_version', options.current_version)
-          if (options.version_code !== undefined) qs.set('version_code', String(options.version_code))
+          const pairs: Array<[string, string]> = [
+            ['device_id', deviceId],
+            ['channel_code', channel],
+            ['platform', platform],
+            ['arch', arch]
+          ]
+          if (options.current_version) pairs.push(['current_version', options.current_version])
+          if (options.version_code !== undefined) pairs.push(['version_code', String(options.version_code)])
+          const canonicalQ = canonicalQuery(pairs)
+          const { headers, nonce } = this.signHeaders('GET', '/api/client/updates/stream', canonicalQ, Buffer.alloc(0))
 
-          const res = await fetch(`${this.baseUrl}/api/client/updates/stream?${qs.toString()}`, {
+          const res = await fetch(`${this.baseUrl}/api/client/updates/stream?${canonicalQ}`, {
             method: 'GET',
+            headers,
             signal: controller.signal
           })
           if (res.status === 401 || res.status === 403) {
@@ -151,6 +309,9 @@ export class Client {
           }
 
           retryDelay = baseBackoff
+          // When requireAuthz, ignore pushed events until a valid authz event proves
+          // the stream comes from the real server.
+          let authzOk = !this.requireAuthz
           let eventType = ''
           const dataLines: string[] = []
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -163,7 +324,18 @@ export class Client {
               if (!line) {
                 if (dataLines.length > 0) {
                   const data = dataLines.join('\n')
-                  if (eventType !== 'connected') {
+                  if (eventType === 'authz') {
+                    if (this.requireAuthz) {
+                      let env: AuthzEnvelope | undefined
+                      try {
+                        env = JSON.parse(data) as AuthzEnvelope
+                      } catch {
+                        throw new AuthzError(API_ERROR_CODE_AUTHZ_INVALID, 'authorization malformed')
+                      }
+                      this.verifyAuthz(env, nonce)
+                      authzOk = true
+                    }
+                  } else if (eventType !== 'connected' && authzOk) {
                     try {
                       onEvent(JSON.parse(data) as UpdatePushEvent)
                     } catch (e) {
@@ -188,6 +360,9 @@ export class Client {
         } catch (err) {
           if (stopped) break
           options.onError?.(err as Error)
+          // A failed/denied verdict means the server is fake or the device is
+          // revoked — stop, don't reconnect.
+          if (err instanceof AuthzError) break
           if (!reconnect) break
           let wait = retryDelay
           if (jitter) wait += Math.floor(Math.random() * (wait / 2))
@@ -221,16 +396,18 @@ export class Client {
     })
   }
 
-  private async request(path: string, body: Record<string, any>) {
+  private async request(pathname: string, body: Record<string, any>): Promise<{ res: import('node-fetch').Response; nonce: string }> {
+    const bodyBuf = Buffer.from(JSON.stringify(body), 'utf8')
     let lastErr: any
     for (let attempt = 0; attempt <= this.retries; attempt++) {
       try {
-        const res = await fetch(`${this.baseUrl}${path}`, {
+        const { headers, nonce } = this.signHeaders('POST', pathname, '', bodyBuf)
+        const res = await fetch(`${this.baseUrl}${pathname}`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body)
+          headers: { 'Content-Type': 'application/json', ...headers },
+          body: bodyBuf
         })
-        return res
+        return { res, nonce }
       } catch (err) {
         lastErr = err
         await new Promise((r) => setTimeout(r, this.backoffMs * Math.pow(2, attempt)))
@@ -240,8 +417,7 @@ export class Client {
   }
 
   async checkUpdate(currentVersion: string, versionCode?: number): Promise<UpdateCheckResponse> {
-    const res = await this.request('/api/client/update-check', {
-      app_key: this.appKey,
+    const { res, nonce } = await this.request('/api/client/update-check', {
       channel_code: this.channel,
       current_version: currentVersion,
       version_code: versionCode,
@@ -251,7 +427,10 @@ export class Client {
       attributes: this.attributes
     })
     if (!res.ok) throw new Error(`update check failed: ${res.status}`)
-    const data = await res.json() as UpdateCheckResponse
+    const text = await res.text()
+    const data = JSON.parse(text) as UpdateCheckResponse
+    // Fail closed: when requireAuthz, the response must carry a valid signed "allow".
+    this.verifyAuthz(data.authz, nonce)
     if (this.verifySignature && data.signature && data.checksum_sha256) {
       this.verifySignatureForChecksum(data.checksum_sha256, data.signature)
     }
@@ -259,8 +438,7 @@ export class Client {
   }
 
   async reportEvent(eventName: string, properties: Record<string, any> = {}) {
-    const res = await this.request('/api/client/events', {
-      app_key: this.appKey,
+    const { res, nonce } = await this.request('/api/client/events', {
       device_id: this.deviceId,
       event_name: eventName,
       event_time: new Date().toISOString(),
@@ -269,6 +447,7 @@ export class Client {
       attributes: this.attributes
     })
     if (!res.ok) throw new Error(`event report failed: ${res.status}`)
+    this.verifyResponseAuthz(await res.text(), nonce)
   }
 
   async reportHeartbeat(appVersion?: string, userId?: string) {
@@ -276,7 +455,6 @@ export class Client {
       throw new Error('device_id required')
     }
     const payload: Record<string, any> = {
-      app_key: this.appKey,
       device_id: this.deviceId
     }
     if (this.channel) payload.channel_code = this.channel
@@ -287,16 +465,17 @@ export class Client {
     if (this.attributes && Object.keys(this.attributes).length > 0) {
       payload.attributes = this.attributes
     }
-    const res = await this.request('/api/client/heartbeat', payload)
+    const { res, nonce } = await this.request('/api/client/heartbeat', payload)
     if (!res.ok) throw new Error(`heartbeat failed: ${res.status}`)
+    this.verifyResponseAuthz(await res.text(), nonce)
   }
 
   async reportEvents(events: any[]) {
-    const res = await this.request('/api/client/events', {
-      app_key: this.appKey,
+    const { res, nonce } = await this.request('/api/client/events', {
       events
     })
     if (!res.ok) throw new Error(`event report failed: ${res.status}`)
+    this.verifyResponseAuthz(await res.text(), nonce)
   }
 
   async reportFeedback(content: string, options: {
@@ -309,7 +488,6 @@ export class Client {
       throw new Error('content required')
     }
     const form = new FormData()
-    form.append('app_key', this.appKey)
     form.append('device_id', this.deviceId)
     if (this.channel) form.append('channel_code', this.channel)
     if (options.rating !== undefined) form.append('rating', String(options.rating))
@@ -326,26 +504,32 @@ export class Client {
     if (Object.keys(metadata).length > 0) {
       form.append('metadata', JSON.stringify(metadata))
     }
-    ;(options.attachments || []).forEach((filePath) => {
-      if (!filePath) return
-      form.append('attachments', fs.createReadStream(filePath))
-    })
+    // Read attachments into buffers so the multipart body can be materialized and
+    // signed (the request signature covers the exact body bytes).
+    for (const filePath of options.attachments || []) {
+      if (!filePath) continue
+      form.append('attachments', fs.readFileSync(filePath), { filename: path.basename(filePath) })
+    }
 
+    const bodyBuf = form.getBuffer()
+    const { headers, nonce } = this.signHeaders('POST', '/api/client/feedback', '', bodyBuf)
     const res = await fetch(`${this.baseUrl}/api/client/feedback`, {
       method: 'POST',
-      headers: form.getHeaders() as any,
-      body: form as any
+      headers: { ...(form.getHeaders() as Record<string, string>), ...headers },
+      body: bodyBuf
     })
     if (!res.ok) {
       const body = await res.text().catch(() => '')
       if (isFeedbackDisabledBody(body)) throw new FeedbackDisabledError()
       throw new Error(`report feedback failed: ${res.status}`)
     }
+    this.verifyResponseAuthz(await res.text(), nonce)
   }
 
   async download(url: string, destPath: string, checksum?: string, signature?: string, onProgress?: (written: number, total: number) => void) {
     const res = await fetch(url)
-    if (!res.ok || !res.body) throw new Error(`download failed: ${res.status}`)
+    const respBody = res.body
+    if (!res.ok || !respBody) throw new Error(`download failed: ${res.status}`)
 
     await fs.promises.mkdir(path.dirname(destPath), { recursive: true })
     const file = fs.createWriteStream(destPath)
@@ -355,14 +539,14 @@ export class Client {
     let written = 0
 
     await new Promise<void>((resolve, reject) => {
-      res.body.on('data', (chunk: Buffer) => {
+      respBody.on('data', (chunk: Buffer) => {
         written += chunk.length
         hash.update(chunk)
         file.write(chunk)
         if (onProgress) onProgress(written, total)
       })
-      res.body.on('error', reject)
-      res.body.on('end', () => {
+      respBody.on('error', reject)
+      respBody.on('end', () => {
         file.end()
         resolve()
       })
@@ -379,17 +563,11 @@ export class Client {
 
   private verifySignatureForChecksum(checksum: string, signature: string) {
     if (!this.publicKey) return
-    const sig = this.decodeBase64OrHex(signature)
+    const sig = decodeKeyMaterial(signature)
     const pubKey = this.publicKey.includes('BEGIN PUBLIC KEY')
       ? createPublicKey(this.publicKey)
-      : createPublicKey({ key: this.decodeBase64OrHex(this.publicKey), format: 'der', type: 'spki' })
+      : createPublicKey({ key: decodeKeyMaterial(this.publicKey), format: 'der', type: 'spki' })
     const ok = verify(null, Buffer.from(checksum), pubKey, sig)
     if (!ok) throw new Error('signature verification failed')
-  }
-
-  private decodeBase64OrHex(value: string): Buffer {
-    const trimmed = value.trim()
-    const isHex = /^[0-9a-fA-F]+$/.test(trimmed) && trimmed.length % 2 === 0
-    return isHex ? Buffer.from(trimmed, 'hex') : Buffer.from(trimmed, 'base64')
   }
 }

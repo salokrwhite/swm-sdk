@@ -1,19 +1,34 @@
 import base64
 import binascii
 import hashlib
+import hmac
 import json
 import os
 import random
 import threading
 import time
+import uuid
 from dataclasses import dataclass, fields
 from typing import Any, Callable, Dict, Optional
+from urllib.parse import quote
 
 import requests
 
 
 class FeedbackDisabledError(Exception):
     pass
+
+
+API_ERROR_CODE_AUTHZ_INVALID = "authz_invalid"
+API_ERROR_CODE_AUTHZ_DENIED = "authz_denied"
+
+
+class AuthzError(Exception):
+    """Raised when a required authorization verdict is missing or invalid (fail closed)."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(f"{code}: {message}")
+        self.code = code
 
 
 def _is_feedback_disabled(resp) -> bool:
@@ -45,6 +60,18 @@ class Maintenance:
 
 
 @dataclass
+class AuthzEnvelope:
+    decision: Optional[str] = None
+    nonce: Optional[str] = None
+    device_id: Optional[str] = None
+    issued_at: int = 0
+    expires_at: int = 0
+    key_id: Optional[str] = None
+    reason: Optional[str] = None
+    signature: Optional[str] = None
+
+
+@dataclass
 class UpdateCheckResponse:
     update_available: bool
     mandatory: bool
@@ -61,6 +88,7 @@ class UpdateCheckResponse:
     rollback_allowed: Optional[bool] = None
     release_notes_url: Optional[str] = None
     maintenance: Optional[Maintenance] = None
+    authz: Optional[AuthzEnvelope] = None
 
 
 @dataclass
@@ -114,15 +142,19 @@ class Client:
     def __init__(
         self,
         base_url: str,
-        app_key: str,
+        app_id: str,
+        app_secret: str,
         timeout: int = 30,
         retries: int = 2,
         backoff: float = 0.5,
         public_key: Optional[str] = None,
         verify_signature: bool = False,
+        require_authz: bool = False,
+        authz_clock_skew_seconds: int = 120,
     ):
         self.base_url = base_url.rstrip("/")
-        self.app_key = app_key
+        self.app_id = app_id
+        self.app_secret = app_secret
         self.channel = ""
         self.platform = ""
         self.arch = ""
@@ -133,19 +165,140 @@ class Client:
         self.backoff = backoff
         self.public_key = public_key
         self.verify_signature = verify_signature
+        # When true, every call that can carry a signed verdict fails closed unless
+        # the response has a valid Ed25519 "allow" bound to this request + device.
+        self.require_authz = require_authz
+        # key_id -> Ed25519 public key (hex or base64).
+        self.authz_public_keys: Dict[str, str] = {}
+        self.authz_clock_skew_seconds = authz_clock_skew_seconds
+
+    # --- request signing (HMAC) -------------------------------------------------
+
+    @staticmethod
+    def _canonical_query(pairs) -> str:
+        items = sorted(((str(k), str(v)) for k, v in pairs), key=lambda kv: (kv[0], kv[1]))
+        return "&".join(f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in items)
+
+    @staticmethod
+    def _sha256_hex(body: bytes) -> str:
+        return hashlib.sha256(body or b"").hexdigest()
+
+    def _hmac_hex(self, canonical: str) -> str:
+        return hmac.new(self.app_secret.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def _sign_headers(self, method: str, pathname: str, canonical_q: str, body: bytes):
+        ts = str(int(time.time()))
+        nonce = str(uuid.uuid4())
+        canonical = "\n".join([
+            method.upper(),
+            pathname,
+            canonical_q,
+            self._sha256_hex(body),
+            ts,
+            nonce,
+            self.app_id,
+        ])
+        headers = {
+            "X-App-Id": self.app_id,
+            "X-Timestamp": ts,
+            "X-Nonce": nonce,
+            "X-Signature": self._hmac_hex(canonical),
+            "X-Sign-Version": "v1",
+        }
+        return headers, nonce
+
+    # --- authz verification -----------------------------------------------------
+
+    @staticmethod
+    def _decode_key_material(value: str) -> bytes:
+        v = (value or "").strip()
+        if not v:
+            raise AuthzError(API_ERROR_CODE_AUTHZ_INVALID, "empty key material")
+        if len(v) % 2 == 0 and all(c in "0123456789abcdefABCDEF" for c in v):
+            return binascii.unhexlify(v)
+        return base64.b64decode(v)
+
+    @staticmethod
+    def _authz_canonical(app_id: str, env: AuthzEnvelope) -> str:
+        return "\n".join([
+            "authz_v1",
+            "app_id:" + app_id,
+            "device_id:" + (env.device_id or ""),
+            "nonce:" + (env.nonce or ""),
+            "decision:" + (env.decision or ""),
+            "reason:" + (env.reason or ""),
+            "issued_at:" + str(env.issued_at or 0),
+            "expires_at:" + str(env.expires_at or 0),
+            "key_id:" + (env.key_id or ""),
+        ])
+
+    def _verify_authz(self, env: Optional[AuthzEnvelope], request_nonce: str) -> None:
+        if not self.require_authz:
+            return
+        if env is None:
+            raise AuthzError(API_ERROR_CODE_AUTHZ_INVALID, "authorization missing")
+        if not request_nonce or env.nonce != request_nonce:
+            raise AuthzError(API_ERROR_CODE_AUTHZ_INVALID, "authorization nonce mismatch")
+        if (env.device_id or "") != (self.device_id or ""):
+            raise AuthzError(API_ERROR_CODE_AUTHZ_INVALID, "authorization device mismatch")
+        skew = self.authz_clock_skew_seconds if self.authz_clock_skew_seconds > 0 else 120
+        now = int(time.time())
+        if (env.expires_at or 0) <= 0 or now > (env.expires_at or 0) + skew:
+            raise AuthzError(API_ERROR_CODE_AUTHZ_INVALID, "authorization expired")
+        key_id = env.key_id or ""
+        pub_encoded = self.authz_public_keys.get(key_id)
+        if not pub_encoded or not pub_encoded.strip():
+            raise AuthzError(API_ERROR_CODE_AUTHZ_INVALID, f"authorization key unknown: {key_id}")
+        if not env.signature or not env.signature.strip():
+            raise AuthzError(API_ERROR_CODE_AUTHZ_INVALID, "authorization signature missing")
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("cryptography is required for authz verification") from exc
+        pub_bytes = self._decode_key_material(pub_encoded)
+        if len(pub_bytes) != 32:
+            raise AuthzError(API_ERROR_CODE_AUTHZ_INVALID, "authorization public key invalid")
+        sig_bytes = self._decode_key_material(env.signature)
+        msg = self._authz_canonical(self.app_id, env).encode("utf-8")
+        try:
+            Ed25519PublicKey.from_public_bytes(pub_bytes).verify(sig_bytes, msg)
+        except AuthzError:
+            raise
+        except Exception:  # noqa: BLE001
+            raise AuthzError(API_ERROR_CODE_AUTHZ_INVALID, "authorization signature invalid")
+        if env.decision != "allow":
+            reason = env.reason if (env.reason and env.reason.strip()) else "access denied"
+            raise AuthzError(API_ERROR_CODE_AUTHZ_DENIED, f"authorization denied: {reason}")
+
+    def _verify_response_authz(self, resp, request_nonce: str) -> None:
+        if not self.require_authz:
+            return
+        env = None
+        try:
+            payload = resp.json()
+            if isinstance(payload, dict) and isinstance(payload.get("authz"), dict):
+                env = AuthzEnvelope(**_filter_known(AuthzEnvelope, payload["authz"]))
+        except Exception:  # noqa: BLE001
+            env = None
+        self._verify_authz(env, request_nonce)
 
     def _request(self, method: str, path: str, payload: Dict[str, Any]):
+        # Serialize once and sign the exact bytes we send (the server hashes the raw body).
+        body = json.dumps(payload).encode("utf-8")
         last_err = None
         for attempt in range(self.retries + 1):
             try:
+                headers, nonce = self._sign_headers(method, path, "", body)
+                headers["Content-Type"] = "application/json"
                 resp = requests.request(
                     method,
                     f"{self.base_url}{path}",
-                    json=payload,
+                    data=body,
+                    headers=headers,
                     timeout=self.timeout,
                 )
                 resp.raise_for_status()
-                return resp
+                return resp, nonce
             except Exception as err:  # noqa: BLE001
                 last_err = err
                 if attempt >= self.retries:
@@ -168,20 +321,21 @@ class Client:
             max_backoff = max(backoff, int(options.reconnect_max_backoff_ms or 20000))
             while not stop_event.is_set():
                 try:
-                    params: Dict[str, Any] = {
-                        "app_key": self.app_key,
-                        "channel_code": channel_code,
-                        "platform": platform,
-                        "arch": arch,
-                        "device_id": device_id,
-                    }
+                    pairs = [
+                        ("device_id", device_id),
+                        ("channel_code", channel_code),
+                        ("platform", platform),
+                        ("arch", arch),
+                    ]
                     if options.current_version:
-                        params["current_version"] = options.current_version
+                        pairs.append(("current_version", options.current_version))
                     if options.version_code is not None:
-                        params["version_code"] = options.version_code
+                        pairs.append(("version_code", str(options.version_code)))
+                    canonical_q = self._canonical_query(pairs)
+                    headers, nonce = self._sign_headers("GET", "/api/client/updates/stream", canonical_q, b"")
                     with requests.get(
-                        f"{self.base_url}/api/client/updates/stream",
-                        params=params,
+                        f"{self.base_url}/api/client/updates/stream?{canonical_q}",
+                        headers=headers,
                         timeout=self.timeout,
                         stream=True,
                     ) as resp:
@@ -189,6 +343,9 @@ class Client:
                             raise RuntimeError(f"stream unauthorized: {resp.status_code}")
                         resp.raise_for_status()
                         backoff = max(300, int(options.reconnect_backoff_ms or 1500))
+                        # When require_authz, ignore pushed events until a valid authz
+                        # event proves the stream comes from the real server.
+                        authz_ok = not self.require_authz
                         event_type = ""
                         data_lines: list[str] = []
                         for raw in resp.iter_lines(decode_unicode=True):
@@ -200,7 +357,17 @@ class Client:
                             if not line:
                                 if data_lines:
                                     data = "\n".join(data_lines)
-                                    if event_type != "connected":
+                                    if event_type == "authz":
+                                        if self.require_authz:
+                                            try:
+                                                env = AuthzEnvelope(**_filter_known(AuthzEnvelope, json.loads(data)))
+                                            except AuthzError:
+                                                raise
+                                            except Exception:  # noqa: BLE001
+                                                raise AuthzError(API_ERROR_CODE_AUTHZ_INVALID, "authorization malformed")
+                                            self._verify_authz(env, nonce)
+                                            authz_ok = True
+                                    elif event_type != "connected" and authz_ok:
                                         payload = json.loads(data)
                                         on_event(UpdatePushEvent(**_filter_known(UpdatePushEvent, payload)))
                                 event_type = ""
@@ -215,6 +382,10 @@ class Client:
                 except Exception as err:  # noqa: BLE001
                     if options.on_error:
                         options.on_error(err)
+                    # A failed/denied verdict means the server is fake or the device
+                    # is revoked — stop, don't reconnect.
+                    if isinstance(err, AuthzError):
+                        return
                     if not options.reconnect:
                         return
                     wait_ms = backoff
@@ -241,7 +412,6 @@ class Client:
 
     def check_update(self, current_version: str, version_code: Optional[int] = None) -> UpdateCheckResponse:
         payload = {
-            "app_key": self.app_key,
             "channel_code": self.channel,
             "current_version": current_version,
             "version_code": version_code,
@@ -250,19 +420,22 @@ class Client:
             "device_id": self.device_id,
             "attributes": self.attributes,
         }
-        resp = self._request("POST", "/api/client/update-check", payload)
+        resp, nonce = self._request("POST", "/api/client/update-check", payload)
         data = resp.json()
         maintenance_raw = data.get("maintenance") if isinstance(data, dict) else None
+        authz_raw = data.get("authz") if isinstance(data, dict) else None
         result = UpdateCheckResponse(**_filter_known(UpdateCheckResponse, data))
         if isinstance(maintenance_raw, dict):
             result.maintenance = Maintenance(**_filter_known(Maintenance, maintenance_raw))
+        result.authz = AuthzEnvelope(**_filter_known(AuthzEnvelope, authz_raw)) if isinstance(authz_raw, dict) else None
+        # Fail closed: when require_authz, the response must carry a valid signed "allow".
+        self._verify_authz(result.authz, nonce)
         if self.verify_signature and result.signature and result.checksum_sha256:
             self._verify_signature(result.checksum_sha256, result.signature)
         return result
 
     def report_event(self, event_name: str, properties: Optional[Dict[str, Any]] = None) -> None:
         payload = {
-            "app_key": self.app_key,
             "device_id": self.device_id,
             "event_name": event_name,
             "event_time": None,
@@ -270,13 +443,13 @@ class Client:
             "properties": properties or {},
             "attributes": self.attributes,
         }
-        self._request("POST", "/api/client/events", payload)
+        resp, nonce = self._request("POST", "/api/client/events", payload)
+        self._verify_response_authz(resp, nonce)
 
     def report_heartbeat(self, app_version: Optional[str] = None, user_id: Optional[str] = None) -> None:
         if not self.device_id:
             raise ValueError("device_id required")
         payload: Dict[str, Any] = {
-            "app_key": self.app_key,
             "device_id": self.device_id,
         }
         if self.channel:
@@ -291,14 +464,15 @@ class Client:
             payload["user_id"] = user_id
         if self.attributes:
             payload["attributes"] = self.attributes
-        self._request("POST", "/api/client/heartbeat", payload)
+        resp, nonce = self._request("POST", "/api/client/heartbeat", payload)
+        self._verify_response_authz(resp, nonce)
 
     def report_events(self, events: list[Dict[str, Any]]) -> None:
         payload = {
-            "app_key": self.app_key,
             "events": events,
         }
-        self._request("POST", "/api/client/events", payload)
+        resp, nonce = self._request("POST", "/api/client/events", payload)
+        self._verify_response_authz(resp, nonce)
 
     def report_feedback(
         self,
@@ -311,7 +485,6 @@ class Client:
         if not content or not content.strip():
             raise ValueError("content required")
         data = {
-            "app_key": self.app_key,
             "device_id": self.device_id,
             "channel_code": self.channel,
             "content": content,
@@ -334,15 +507,22 @@ class Client:
                 continue
             files.append(("attachments", open(file_path, "rb")))
         try:
-            resp = requests.post(
-                f"{self.base_url}/api/client/feedback",
-                data=data,
-                files=files,
-                timeout=self.timeout,
+            # Build the request to materialize the exact multipart body, then sign it
+            # (the server's request signature covers the raw body bytes).
+            session = requests.Session()
+            prepared = session.prepare_request(
+                requests.Request("POST", f"{self.base_url}/api/client/feedback", data=data, files=files)
             )
+            body = prepared.body if prepared.body is not None else b""
+            if isinstance(body, str):
+                body = body.encode("utf-8")
+            headers, nonce = self._sign_headers("POST", "/api/client/feedback", "", body)
+            prepared.headers.update(headers)
+            resp = session.send(prepared, timeout=self.timeout)
             if resp.status_code >= 400 and _is_feedback_disabled(resp):
                 raise FeedbackDisabledError("feedback disabled")
             resp.raise_for_status()
+            self._verify_response_authz(resp, nonce)
         finally:
             for _, fh in files:
                 try:

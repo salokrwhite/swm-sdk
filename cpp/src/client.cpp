@@ -2,6 +2,7 @@
 
 #include <cpr/cpr.h>
 #include <cpr/util.h>
+#include <openssl/evp.h>
 #include <algorithm>
 #include <cstdint>
 #include <chrono>
@@ -10,6 +11,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <sstream>
 #include <random>
@@ -50,10 +52,8 @@ bool is_feedback_disabled_body(const std::string& body) {
   return false;
 }
 
-std::string sha256_hex(const std::string& data) {
-  // Minimal SHA256 implementation (public domain)
-  // Source: https://github.com/B-Con/crypto-algorithms (adapted)
-  // To keep dependencies minimal, we embed a tiny implementation here.
+// Minimal SHA256 (public domain, adapted) producing the raw 32-byte digest.
+std::string sha256_raw(const std::string& data) {
   static const unsigned int k[64] = {
     0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
     0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
@@ -103,27 +103,286 @@ std::string sha256_hex(const std::string& data) {
     h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
   }
 
-  static const char* hex = "0123456789abcdef";
   std::string out;
-  out.reserve(64);
+  out.reserve(32);
   for (int i = 0; i < 8; ++i) {
     for (int j = 3; j >= 0; --j) {
-      uint8_t byte = (h[i] >> (j * 8)) & 0xff;
-      out.push_back(hex[(byte >> 4) & 0xf]);
-      out.push_back(hex[byte & 0xf]);
+      out.push_back(static_cast<char>((h[i] >> (j * 8)) & 0xff));
     }
   }
   return out;
 }
 
+std::string to_hex(const std::string& bytes) {
+  static const char* hex = "0123456789abcdef";
+  std::string out;
+  out.reserve(bytes.size() * 2);
+  for (unsigned char b : bytes) {
+    out.push_back(hex[(b >> 4) & 0xf]);
+    out.push_back(hex[b & 0xf]);
+  }
+  return out;
+}
+
+std::string sha256_hex(const std::string& data) {
+  return to_hex(sha256_raw(data));
+}
+
+std::string hmac_sha256_hex(const std::string& key, const std::string& msg) {
+  const size_t B = 64;
+  std::string k = key;
+  if (k.size() > B) k = sha256_raw(k);
+  if (k.size() < B) k.resize(B, '\0');
+  std::string ipad(B, 0x36), opad(B, 0x5c);
+  for (size_t i = 0; i < B; ++i) {
+    ipad[i] = static_cast<char>(ipad[i] ^ k[i]);
+    opad[i] = static_cast<char>(opad[i] ^ k[i]);
+  }
+  std::string inner = sha256_raw(ipad + msg);
+  return to_hex(sha256_raw(opad + inner));
+}
+
+long long now_unix() {
+  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+std::string gen_nonce() {
+  std::random_device rd;
+  std::mt19937 g(rd());
+  std::uniform_int_distribution<int> d(0, 15);
+  static const char* hexd = "0123456789abcdef";
+  const std::string fmt = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx";
+  std::string u;
+  u.reserve(fmt.size());
+  for (char c : fmt) {
+    if (c == 'x') u.push_back(hexd[d(g)]);
+    else if (c == 'y') u.push_back(hexd[(d(g) & 0x3) | 0x8]);
+    else u.push_back(c);
+  }
+  return u;
+}
+
+std::string escape_rfc3986(const std::string& s) {
+  static const char* hexd = "0123456789ABCDEF";
+  std::string out;
+  out.reserve(s.size());
+  for (unsigned char c : s) {
+    if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      out.push_back(static_cast<char>(c));
+    } else {
+      out.push_back('%');
+      out.push_back(hexd[c >> 4]);
+      out.push_back(hexd[c & 0xf]);
+    }
+  }
+  return out;
+}
+
+std::string canonical_query(std::vector<std::pair<std::string, std::string>> pairs) {
+  std::sort(pairs.begin(), pairs.end());
+  std::string out;
+  for (size_t i = 0; i < pairs.size(); ++i) {
+    if (i) out.push_back('&');
+    out += escape_rfc3986(pairs[i].first) + "=" + escape_rfc3986(pairs[i].second);
+  }
+  return out;
+}
+
+std::string hex_decode(const std::string& s) {
+  auto val = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  std::string out;
+  out.reserve(s.size() / 2);
+  for (size_t i = 0; i + 1 < s.size(); i += 2) {
+    int hi = val(s[i]), lo = val(s[i + 1]);
+    if (hi < 0 || lo < 0) return std::string();
+    out.push_back(static_cast<char>((hi << 4) | lo));
+  }
+  return out;
+}
+
+std::string base64_decode(const std::string& in) {
+  static const std::string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::vector<int> T(256, -1);
+  for (int i = 0; i < 64; ++i) T[static_cast<unsigned char>(chars[i])] = i;
+  std::string out;
+  int val = 0, valb = -8;
+  for (unsigned char c : in) {
+    if (c == '=') break;
+    if (T[c] == -1) continue;
+    val = (val << 6) + T[c];
+    valb += 6;
+    if (valb >= 0) {
+      out.push_back(static_cast<char>((val >> valb) & 0xFF));
+      valb -= 8;
+    }
+  }
+  return out;
+}
+
+std::string decode_key_material(const std::string& value) {
+  std::string s = value;
+  // trim
+  size_t a = s.find_first_not_of(" \t\r\n");
+  size_t b = s.find_last_not_of(" \t\r\n");
+  s = (a == std::string::npos) ? "" : s.substr(a, b - a + 1);
+  if (s.empty()) throw AuthzError(kApiErrorCodeAuthzInvalid, "empty key material");
+  bool all_hex = (s.size() % 2 == 0);
+  if (all_hex) {
+    for (char c : s) {
+      if (!std::isxdigit(static_cast<unsigned char>(c))) { all_hex = false; break; }
+    }
+  }
+  return all_hex ? hex_decode(s) : base64_decode(s);
+}
+
+// Must match backend internal/auth/authz.go authzCanonical byte-for-byte.
+std::string authz_canonical(const std::string& app_id, const AuthzEnvelope& env) {
+  std::ostringstream os;
+  os << "authz_v1" << "\n"
+     << "app_id:" << app_id << "\n"
+     << "device_id:" << env.device_id << "\n"
+     << "nonce:" << env.nonce << "\n"
+     << "decision:" << env.decision << "\n"
+     << "reason:" << env.reason << "\n"
+     << "issued_at:" << env.issued_at << "\n"
+     << "expires_at:" << env.expires_at << "\n"
+     << "key_id:" << env.key_id;
+  return os.str();
+}
+
+bool ed25519_verify(const std::string& pub, const std::string& msg, const std::string& sig) {
+  if (pub.size() != 32) return false;
+  EVP_PKEY* pkey = EVP_PKEY_new_raw_public_key(
+      EVP_PKEY_ED25519, nullptr,
+      reinterpret_cast<const unsigned char*>(pub.data()), pub.size());
+  if (!pkey) return false;
+  EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+  bool ok = false;
+  if (ctx && EVP_DigestVerifyInit(ctx, nullptr, nullptr, nullptr, pkey) == 1) {
+    int rc = EVP_DigestVerify(
+        ctx,
+        reinterpret_cast<const unsigned char*>(sig.data()), sig.size(),
+        reinterpret_cast<const unsigned char*>(msg.data()), msg.size());
+    ok = (rc == 1);
+  }
+  if (ctx) EVP_MD_CTX_free(ctx);
+  EVP_PKEY_free(pkey);
+  return ok;
+}
+
+cpr::Header make_signed_header(const std::string& app_id, const std::string& app_secret,
+                               const std::string& method, const std::string& path,
+                               const std::string& canonical_q, const std::string& body,
+                               std::string& out_nonce) {
+  long long ts = now_unix();
+  std::string nonce = gen_nonce();
+  std::string canonical = method + "\n" + path + "\n" + canonical_q + "\n" +
+                          sha256_hex(body) + "\n" + std::to_string(ts) + "\n" + nonce + "\n" + app_id;
+  std::string sig = hmac_sha256_hex(app_secret, canonical);
+  out_nonce = nonce;
+  return cpr::Header{
+    {"X-App-Id", app_id},
+    {"X-Timestamp", std::to_string(ts)},
+    {"X-Nonce", nonce},
+    {"X-Signature", sig},
+    {"X-Sign-Version", "v1"}
+  };
+}
+
+std::optional<AuthzEnvelope> parse_authz_json(const nlohmann::json& a) {
+  if (!a.is_object()) return std::nullopt;
+  AuthzEnvelope e;
+  e.decision = a.value("decision", "");
+  e.nonce = a.value("nonce", "");
+  e.device_id = a.value("device_id", "");
+  e.issued_at = a.value("issued_at", 0LL);
+  e.expires_at = a.value("expires_at", 0LL);
+  e.key_id = a.value("key_id", "");
+  e.reason = a.value("reason", "");
+  e.signature = a.value("signature", "");
+  return e;
+}
+
+std::optional<AuthzEnvelope> extract_authz_from_body(const std::string& body) {
+  auto j = nlohmann::json::parse(body, nullptr, false);
+  if (j.is_discarded() || !j.is_object() || !j.contains("authz")) return std::nullopt;
+  return parse_authz_json(j["authz"]);
+}
+
+void verify_authz_impl(bool require_authz, const std::map<std::string, std::string>& keys, int skew_secs,
+                       const std::string& app_id, const std::string& device_id,
+                       const std::optional<AuthzEnvelope>& env_opt, const std::string& request_nonce) {
+  if (!require_authz) return;
+  if (!env_opt.has_value()) throw AuthzError(kApiErrorCodeAuthzInvalid, "authorization missing");
+  const AuthzEnvelope& env = *env_opt;
+  if (request_nonce.empty() || env.nonce != request_nonce) {
+    throw AuthzError(kApiErrorCodeAuthzInvalid, "authorization nonce mismatch");
+  }
+  if (env.device_id != device_id) {
+    throw AuthzError(kApiErrorCodeAuthzInvalid, "authorization device mismatch");
+  }
+  int skew = skew_secs > 0 ? skew_secs : 120;
+  long long now = now_unix();
+  if (env.expires_at <= 0 || now > env.expires_at + skew) {
+    throw AuthzError(kApiErrorCodeAuthzInvalid, "authorization expired");
+  }
+  auto it = keys.find(env.key_id);
+  if (it == keys.end() || it->second.empty()) {
+    throw AuthzError(kApiErrorCodeAuthzInvalid, "authorization key unknown: " + env.key_id);
+  }
+  if (env.signature.empty()) {
+    throw AuthzError(kApiErrorCodeAuthzInvalid, "authorization signature missing");
+  }
+  std::string pub = decode_key_material(it->second);
+  if (pub.size() != 32) {
+    throw AuthzError(kApiErrorCodeAuthzInvalid, "authorization public key invalid");
+  }
+  std::string sig = decode_key_material(env.signature);
+  std::string msg = authz_canonical(app_id, env);
+  if (!ed25519_verify(pub, msg, sig)) {
+    throw AuthzError(kApiErrorCodeAuthzInvalid, "authorization signature invalid");
+  }
+  if (env.decision != "allow") {
+    std::string reason = env.reason.empty() ? "access denied" : env.reason;
+    throw AuthzError(kApiErrorCodeAuthzDenied, "authorization denied: " + reason);
+  }
+}
+
+std::string read_file(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  std::ostringstream ss;
+  ss << f.rdbuf();
+  return ss.str();
+}
+
+void mp_field(std::string& body, const std::string& boundary, const std::string& name, const std::string& value) {
+  body += "--" + boundary + "\r\n";
+  body += "Content-Disposition: form-data; name=\"" + name + "\"\r\n\r\n";
+  body += value;
+  body += "\r\n";
+}
+
+void mp_file(std::string& body, const std::string& boundary, const std::string& name,
+             const std::string& filename, const std::string& content) {
+  body += "--" + boundary + "\r\n";
+  body += "Content-Disposition: form-data; name=\"" + name + "\"; filename=\"" + filename + "\"\r\n";
+  body += "Content-Type: application/octet-stream\r\n\r\n";
+  body += content;
+  body += "\r\n";
+}
+
 } // namespace
 
-Client::Client(std::string base_url, std::string app_key)
-  : base_url_(trim_trailing_slash(base_url)), app_key_(std::move(app_key)) {}
+Client::Client(std::string base_url, std::string app_id, std::string app_secret)
+  : base_url_(trim_trailing_slash(base_url)), app_id_(std::move(app_id)), app_secret_(std::move(app_secret)) {}
 
 UpdateCheckResponse Client::check_update(const std::string& current_version, const std::optional<int>& version_code) {
   nlohmann::json body = {
-    {"app_key", app_key_},
     {"channel_code", channel},
     {"current_version", current_version},
     {"platform", platform},
@@ -134,14 +393,14 @@ UpdateCheckResponse Client::check_update(const std::string& current_version, con
   if (version_code.has_value()) {
     body["version_code"] = version_code.value();
   }
+  std::string body_str = body.dump();
 
   cpr::Response res;
+  std::string nonce;
   for (int attempt = 0; attempt <= retries; ++attempt) {
-    res = cpr::Post(
-      cpr::Url{base_url_ + "/api/client/update-check"},
-      cpr::Header{{"Content-Type", "application/json"}},
-      cpr::Body{body.dump()}
-    );
+    cpr::Header hdr = make_signed_header(app_id_, app_secret_, "POST", "/api/client/update-check", "", body_str, nonce);
+    hdr["Content-Type"] = "application/json";
+    res = cpr::Post(cpr::Url{base_url_ + "/api/client/update-check"}, hdr, cpr::Body{body_str});
     if (res.error.code == cpr::ErrorCode::OK) {
       break;
     }
@@ -175,6 +434,11 @@ UpdateCheckResponse Client::check_update(const std::string& current_version, con
     maint.active = m.value("active", false);
     out.maintenance = maint;
   }
+  if (json.contains("authz")) {
+    out.authz = parse_authz_json(json["authz"]);
+  }
+  // Fail closed: when require_authz, the response must carry a valid signed "allow".
+  verify_authz_impl(require_authz, authz_public_keys, authz_clock_skew_seconds, app_id_, device_id, out.authz, nonce);
   if (signature_verifier && !out.signature.empty() && !out.checksum_sha256.empty()) {
     if (!signature_verifier(out.checksum_sha256, out.signature)) {
       throw std::runtime_error("signature verification failed");
@@ -185,21 +449,20 @@ UpdateCheckResponse Client::check_update(const std::string& current_version, con
 
 void Client::report_event(const std::string& event_name, const nlohmann::json& properties) {
   nlohmann::json body = {
-    {"app_key", app_key_},
     {"device_id", device_id},
     {"event_name", event_name},
     {"channel_code", channel},
     {"properties", properties},
     {"attributes", attributes}
   };
+  std::string body_str = body.dump();
 
   cpr::Response res;
+  std::string nonce;
   for (int attempt = 0; attempt <= retries; ++attempt) {
-    res = cpr::Post(
-      cpr::Url{base_url_ + "/api/client/events"},
-      cpr::Header{{"Content-Type", "application/json"}},
-      cpr::Body{body.dump()}
-    );
+    cpr::Header hdr = make_signed_header(app_id_, app_secret_, "POST", "/api/client/events", "", body_str, nonce);
+    hdr["Content-Type"] = "application/json";
+    res = cpr::Post(cpr::Url{base_url_ + "/api/client/events"}, hdr, cpr::Body{body_str});
     if (res.error.code == cpr::ErrorCode::OK) {
       break;
     }
@@ -209,6 +472,7 @@ void Client::report_event(const std::string& event_name, const nlohmann::json& p
   if (res.status_code >= 300) {
     throw std::runtime_error("report event failed: " + std::to_string(res.status_code));
   }
+  verify_authz_impl(require_authz, authz_public_keys, authz_clock_skew_seconds, app_id_, device_id, extract_authz_from_body(res.text), nonce);
 }
 
 UpdateWatchHandle Client::start_update_stream(const UpdateStreamOptions& options, const std::function<void(const UpdatePushEvent&)>& on_event) {
@@ -221,6 +485,12 @@ UpdateWatchHandle Client::start_update_stream(const UpdateStreamOptions& options
   }
 
   auto stop_flag = std::make_shared<std::atomic<bool>>(false);
+  std::string app_id = app_id_;
+  std::string app_secret = app_secret_;
+  bool require_authz_v = require_authz;
+  std::map<std::string, std::string> keys = authz_public_keys;
+  int skew = authz_clock_skew_seconds;
+  std::string base_url = base_url_;
   std::thread([=]() {
     int backoff = std::max(300, options.reconnect_backoff_ms);
     int max_backoff = std::max(backoff, options.reconnect_max_backoff_ms);
@@ -228,20 +498,23 @@ UpdateWatchHandle Client::start_update_stream(const UpdateStreamOptions& options
 
     while (!stop_flag->load()) {
       try {
-        std::ostringstream qs;
-        qs << "?app_key=" << cpr::util::urlEncode(app_key_)
-           << "&channel_code=" << cpr::util::urlEncode(channel_code)
-           << "&platform=" << cpr::util::urlEncode(stream_platform)
-           << "&arch=" << cpr::util::urlEncode(stream_arch)
-           << "&device_id=" << cpr::util::urlEncode(stream_device);
+        std::vector<std::pair<std::string, std::string>> params = {
+          {"device_id", stream_device},
+          {"channel_code", channel_code},
+          {"platform", stream_platform},
+          {"arch", stream_arch}
+        };
         if (!options.current_version.empty()) {
-          qs << "&current_version=" << cpr::util::urlEncode(options.current_version);
+          params.push_back({"current_version", options.current_version});
         }
         if (options.version_code.has_value()) {
-          qs << "&version_code=" << options.version_code.value();
+          params.push_back({"version_code", std::to_string(options.version_code.value())});
         }
+        std::string query = canonical_query(params);
+        std::string nonce;
+        cpr::Header hdr = make_signed_header(app_id, app_secret, "GET", "/api/client/updates/stream", query, "", nonce);
 
-        auto res = cpr::Get(cpr::Url{base_url_ + "/api/client/updates/stream" + qs.str()});
+        auto res = cpr::Get(cpr::Url{base_url + "/api/client/updates/stream?" + query}, hdr);
         if (res.status_code == 401 || res.status_code == 403) {
           if (options.on_error) {
             options.on_error("stream unauthorized: " + std::to_string(res.status_code));
@@ -253,6 +526,9 @@ UpdateWatchHandle Client::start_update_stream(const UpdateStreamOptions& options
         }
 
         backoff = std::max(300, options.reconnect_backoff_ms);
+        // When require_authz, ignore pushed events until a valid authz event proves
+        // the stream comes from the real server.
+        bool authz_ok = !require_authz_v;
         std::istringstream stream(res.text);
         std::string line;
         std::string event_type;
@@ -265,24 +541,41 @@ UpdateWatchHandle Client::start_update_stream(const UpdateStreamOptions& options
             line.pop_back();
           }
           if (line.empty()) {
-            if (!data.empty() && event_type != "connected") {
-              auto payload = nlohmann::json::parse(data, nullptr, false);
-              if (!payload.is_discarded()) {
-                UpdatePushEvent evt;
-                evt.id = payload.value("id", "");
-                evt.event_type = payload.value("event_type", "");
-                evt.org_id = payload.value("org_id", "");
-                evt.app_id = payload.value("app_id", "");
-                evt.channel_code = payload.value("channel_code", "");
-                evt.platform = payload.value("platform", "");
-                evt.arch = payload.value("arch", "");
-                evt.release_id = payload.value("release_id", "");
-                evt.published_at = payload.value("published_at", "");
-                evt.reason = payload.value("reason", "");
-                evt.message = payload.value("message", "");
-                evt.maintenance_start_at = payload.value("maintenance_start_at", "");
-                if (on_event) {
-                  on_event(evt);
+            if (!data.empty()) {
+              if (event_type == "authz") {
+                if (require_authz_v) {
+                  auto j = nlohmann::json::parse(data, nullptr, false);
+                  if (j.is_discarded()) {
+                    if (options.on_error) options.on_error("authorization malformed");
+                    return;
+                  }
+                  try {
+                    verify_authz_impl(require_authz_v, keys, skew, app_id, stream_device, parse_authz_json(j), nonce);
+                  } catch (const std::exception& ex) {
+                    if (options.on_error) options.on_error(ex.what());
+                    return;  // fatal: fake server / revoked device, don't reconnect
+                  }
+                  authz_ok = true;
+                }
+              } else if (event_type != "connected" && authz_ok) {
+                auto payload = nlohmann::json::parse(data, nullptr, false);
+                if (!payload.is_discarded()) {
+                  UpdatePushEvent evt;
+                  evt.id = payload.value("id", "");
+                  evt.event_type = payload.value("event_type", "");
+                  evt.org_id = payload.value("org_id", "");
+                  evt.app_id = payload.value("app_id", "");
+                  evt.channel_code = payload.value("channel_code", "");
+                  evt.platform = payload.value("platform", "");
+                  evt.arch = payload.value("arch", "");
+                  evt.release_id = payload.value("release_id", "");
+                  evt.published_at = payload.value("published_at", "");
+                  evt.reason = payload.value("reason", "");
+                  evt.message = payload.value("message", "");
+                  evt.maintenance_start_at = payload.value("maintenance_start_at", "");
+                  if (on_event) {
+                    on_event(evt);
+                  }
                 }
               }
             }
@@ -344,7 +637,6 @@ UpdateWatchHandle Client::watch_updates(const UpdateStreamOptions& options, cons
 
 void Client::report_heartbeat(const std::string& app_version, const std::string& user_id) {
   nlohmann::json body = {
-    {"app_key", app_key_},
     {"device_id", device_id}
   };
   if (!channel.empty()) {
@@ -365,14 +657,14 @@ void Client::report_heartbeat(const std::string& app_version, const std::string&
   if (!attributes.is_null() && !attributes.empty()) {
     body["attributes"] = attributes;
   }
+  std::string body_str = body.dump();
 
   cpr::Response res;
+  std::string nonce;
   for (int attempt = 0; attempt <= retries; ++attempt) {
-    res = cpr::Post(
-      cpr::Url{base_url_ + "/api/client/heartbeat"},
-      cpr::Header{{"Content-Type", "application/json"}},
-      cpr::Body{body.dump()}
-    );
+    cpr::Header hdr = make_signed_header(app_id_, app_secret_, "POST", "/api/client/heartbeat", "", body_str, nonce);
+    hdr["Content-Type"] = "application/json";
+    res = cpr::Post(cpr::Url{base_url_ + "/api/client/heartbeat"}, hdr, cpr::Body{body_str});
     if (res.error.code == cpr::ErrorCode::OK) {
       break;
     }
@@ -382,20 +674,20 @@ void Client::report_heartbeat(const std::string& app_version, const std::string&
   if (res.status_code >= 300) {
     throw std::runtime_error("heartbeat failed: " + std::to_string(res.status_code));
   }
+  verify_authz_impl(require_authz, authz_public_keys, authz_clock_skew_seconds, app_id_, device_id, extract_authz_from_body(res.text), nonce);
 }
 
 void Client::report_events(const nlohmann::json& events) {
   nlohmann::json body = {
-    {"app_key", app_key_},
     {"events", events}
   };
+  std::string body_str = body.dump();
   cpr::Response res;
+  std::string nonce;
   for (int attempt = 0; attempt <= retries; ++attempt) {
-    res = cpr::Post(
-      cpr::Url{base_url_ + "/api/client/events"},
-      cpr::Header{{"Content-Type", "application/json"}},
-      cpr::Body{body.dump()}
-    );
+    cpr::Header hdr = make_signed_header(app_id_, app_secret_, "POST", "/api/client/events", "", body_str, nonce);
+    hdr["Content-Type"] = "application/json";
+    res = cpr::Post(cpr::Url{base_url_ + "/api/client/events"}, hdr, cpr::Body{body_str});
     if (res.error.code == cpr::ErrorCode::OK) {
       break;
     }
@@ -404,6 +696,7 @@ void Client::report_events(const nlohmann::json& events) {
   if (res.status_code >= 300) {
     throw std::runtime_error("report event failed: " + std::to_string(res.status_code));
   }
+  verify_authz_impl(require_authz, authz_public_keys, authz_clock_skew_seconds, app_id_, device_id, extract_authz_from_body(res.text), nonce);
 }
 
 void Client::report_feedback(const std::string& content,
@@ -415,51 +708,51 @@ void Client::report_feedback(const std::string& content,
     throw std::runtime_error("content required");
   }
 
-  auto build_multipart = [&]() {
-    cpr::Multipart multipart{{"app_key", app_key_}, {"device_id", device_id}, {"content", content}};
-    if (!channel.empty()) {
-      multipart.parts.push_back({"channel_code", channel});
-    }
-    if (rating.has_value()) {
-      multipart.parts.push_back({"rating", std::to_string(rating.value())});
-    }
-    if (!contact.empty()) {
-      multipart.parts.push_back({"contact", contact});
-    }
+  // Build the multipart body manually so we can sign the exact bytes sent.
+  std::string boundary = "----swm-" + gen_nonce();
+  std::string body;
+  mp_field(body, boundary, "device_id", device_id);
+  mp_field(body, boundary, "content", content);
+  if (!channel.empty()) {
+    mp_field(body, boundary, "channel_code", channel);
+  }
+  if (rating.has_value()) {
+    mp_field(body, boundary, "rating", std::to_string(rating.value()));
+  }
+  if (!contact.empty()) {
+    mp_field(body, boundary, "contact", contact);
+  }
 
-    nlohmann::json merged = metadata.is_null() ? nlohmann::json::object() : metadata;
-    if (!merged.is_object()) {
-      merged = nlohmann::json::object();
+  nlohmann::json merged = metadata.is_object() ? metadata : nlohmann::json::object();
+  if (!attributes.is_null() && !attributes.empty() && !merged.contains("attributes")) {
+    merged["attributes"] = attributes;
+  }
+  if (merged.contains("app_version")) {
+    if (merged["app_version"].is_string()) {
+      mp_field(body, boundary, "app_version", merged["app_version"].get<std::string>());
+    } else {
+      mp_field(body, boundary, "app_version", merged["app_version"].dump());
     }
-    if (!attributes.is_null() && !attributes.empty() && !merged.contains("attributes")) {
-      merged["attributes"] = attributes;
-    }
-    if (merged.contains("app_version")) {
-      if (merged["app_version"].is_string()) {
-        multipart.parts.push_back({"app_version", merged["app_version"].get<std::string>()});
-      } else {
-        multipart.parts.push_back({"app_version", merged["app_version"].dump()});
-      }
-    }
-    if (!merged.empty()) {
-      multipart.parts.push_back({"metadata", merged.dump()});
-    }
+  }
+  if (!merged.empty()) {
+    mp_field(body, boundary, "metadata", merged.dump());
+  }
 
-    for (const auto& file_path : attachments) {
-      if (file_path.empty()) {
-        continue;
-      }
-      multipart.parts.push_back({"attachments", cpr::File{file_path}});
+  for (const auto& file_path : attachments) {
+    if (file_path.empty() || !std::filesystem::exists(file_path)) {
+      continue;
     }
-    return multipart;
-  };
+    std::string fname = std::filesystem::path(file_path).filename().string();
+    mp_file(body, boundary, "attachments", fname, read_file(file_path));
+  }
+  body += "--" + boundary + "--\r\n";
 
   cpr::Response res;
+  std::string nonce;
   for (int attempt = 0; attempt <= retries; ++attempt) {
-    res = cpr::Post(
-      cpr::Url{base_url_ + "/api/client/feedback"},
-      build_multipart()
-    );
+    cpr::Header hdr = make_signed_header(app_id_, app_secret_, "POST", "/api/client/feedback", "", body, nonce);
+    hdr["Content-Type"] = "multipart/form-data; boundary=" + boundary;
+    res = cpr::Post(cpr::Url{base_url_ + "/api/client/feedback"}, hdr, cpr::Body{body});
     if (res.error.code == cpr::ErrorCode::OK) {
       break;
     }
@@ -471,6 +764,7 @@ void Client::report_feedback(const std::string& content,
     }
     throw std::runtime_error("report feedback failed: " + std::to_string(res.status_code));
   }
+  verify_authz_impl(require_authz, authz_public_keys, authz_clock_skew_seconds, app_id_, device_id, extract_authz_from_body(res.text), nonce);
 }
 
 void Client::download(const std::string& url, const std::string& dest_path, const std::string& checksum_sha256, const std::string& signature) {
