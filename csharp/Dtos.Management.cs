@@ -24,7 +24,6 @@ public sealed class ReleaseDto : DynamicDto { }
 public sealed class ReleaseChannelDto : DynamicDto { }
 public sealed class ArtifactDto : DynamicDto { }
 public sealed class ReleaseTemplateDto : DynamicDto { }
-public sealed class AppSecretDto : DynamicDto { }
 public sealed class AppMemberDto : DynamicDto { }
 
 public sealed class ListResponse<T>
@@ -61,18 +60,6 @@ public sealed class TemplateResponse
 {
     [JsonPropertyName("template")]
     public ReleaseTemplateDto Template { get; set; } = new();
-}
-
-public sealed class AppSecretCreateResponse
-{
-    [JsonPropertyName("app_secret")]
-    public string AppSecret { get; set; } = string.Empty;
-
-    [JsonPropertyName("item")]
-    public AppSecretDto Item { get; set; } = new();
-
-    [JsonPropertyName("app_id")]
-    public string? AppId { get; set; }
 }
 
 public sealed class AppRegionRulesResponse

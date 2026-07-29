@@ -28,6 +28,36 @@ public sealed class UpdateCheckRequest
 
     [JsonPropertyName("attributes")]
     public Dictionary<string, JsonElement> Attributes { get; set; } = new();
+
+	[JsonPropertyName("device_auth")]
+	public DeviceAuthRegistration? DeviceAuth { get; set; }
+}
+
+public sealed class DeviceAuthRegistration
+{
+	[JsonPropertyName("install_id")]
+	public string InstallId { get; set; } = string.Empty;
+
+	[JsonPropertyName("key_id")]
+	public string KeyId { get; set; } = string.Empty;
+
+	[JsonPropertyName("key_thumbprint")]
+	public string KeyThumbprint { get; set; } = string.Empty;
+
+	[JsonPropertyName("public_key_sec1")]
+	public string PublicKeySec1 { get; set; } = string.Empty;
+
+	[JsonPropertyName("challenge")]
+	public string? Challenge { get; set; }
+}
+
+public sealed class DeviceRegistrationChallengeResponse
+{
+	[JsonPropertyName("challenge")]
+	public string? Challenge { get; set; }
+
+	[JsonPropertyName("expires_at")]
+	public long ExpiresAt { get; set; }
 }
 
 public sealed class UpdateCheckResponse
@@ -53,6 +83,9 @@ public sealed class UpdateCheckResponse
     [JsonPropertyName("version")]
     public string? Version { get; set; }
 
+	[JsonPropertyName("version_code")]
+	public int? VersionCode { get; set; }
+
     [JsonPropertyName("notes")]
     public string? Notes { get; set; }
 
@@ -65,6 +98,24 @@ public sealed class UpdateCheckResponse
     [JsonPropertyName("signature")]
     public string? Signature { get; set; }
 
+	[JsonPropertyName("manifest_key_id")]
+	public string? ManifestKeyId { get; set; }
+
+	[JsonPropertyName("manifest_public_key")]
+	public string? ManifestPublicKey { get; set; }
+
+	[JsonPropertyName("artifact_file_name")]
+	public string? ArtifactFileName { get; set; }
+
+	[JsonPropertyName("artifact_platform")]
+	public string? ArtifactPlatform { get; set; }
+
+	[JsonPropertyName("artifact_arch")]
+	public string? ArtifactArch { get; set; }
+
+	[JsonPropertyName("authz_protocol")]
+	public string? AuthzProtocol { get; set; }
+
     [JsonPropertyName("size")]
     public long Size { get; set; }
 
@@ -76,42 +127,6 @@ public sealed class UpdateCheckResponse
 
     [JsonPropertyName("maintenance")]
     public Maintenance? Maintenance { get; set; }
-
-    [JsonPropertyName("authz")]
-    public AuthzEnvelope? Authz { get; set; }
-}
-
-/// <summary>
-/// Device-bound authorization verdict signed by the server with an Ed25519 key.
-/// The client MUST verify it (signature + nonce + device + expiry + decision)
-/// before trusting the response. A fake/offline server cannot forge it because
-/// the private key never ships with the client.
-/// </summary>
-public sealed class AuthzEnvelope
-{
-    [JsonPropertyName("decision")]
-    public string? Decision { get; set; }
-
-    [JsonPropertyName("nonce")]
-    public string? Nonce { get; set; }
-
-    [JsonPropertyName("device_id")]
-    public string? DeviceId { get; set; }
-
-    [JsonPropertyName("issued_at")]
-    public long IssuedAt { get; set; }
-
-    [JsonPropertyName("expires_at")]
-    public long ExpiresAt { get; set; }
-
-    [JsonPropertyName("key_id")]
-    public string? KeyId { get; set; }
-
-    [JsonPropertyName("reason")]
-    public string? Reason { get; set; }
-
-    [JsonPropertyName("signature")]
-    public string? Signature { get; set; }
 }
 
 public sealed class Maintenance
@@ -271,10 +286,38 @@ internal sealed class GenericOkResponse
     public Dictionary<string, JsonElement>? Data { get; set; }
 }
 
-// AuthzCarrier extracts just the signed verdict from responses whose body is
-// otherwise ignored (heartbeat/events/feedback).
-internal sealed class AuthzCarrier
+public sealed class AuthzV3Envelope
 {
-    [JsonPropertyName("authz")]
-    public AuthzEnvelope? Authz { get; set; }
+	[JsonPropertyName("version")]
+	public string? Version { get; set; }
+	[JsonPropertyName("decision")]
+	public string? Decision { get; set; }
+	[JsonPropertyName("release_id")]
+	public string? ReleaseId { get; set; }
+	[JsonPropertyName("device_id")]
+	public string? DeviceId { get; set; }
+	[JsonPropertyName("nonce")]
+	public string? Nonce { get; set; }
+	[JsonPropertyName("data_sha256")]
+	public string? DataSha256 { get; set; }
+	[JsonPropertyName("session")]
+	public string? Session { get; set; }
+	[JsonPropertyName("issued_at")]
+	public long IssuedAt { get; set; }
+	[JsonPropertyName("expires_at")]
+	public long ExpiresAt { get; set; }
+	[JsonPropertyName("key_id")]
+	public string? KeyId { get; set; }
+	[JsonPropertyName("reason")]
+	public string? Reason { get; set; }
+	[JsonPropertyName("signature")]
+	public string? Signature { get; set; }
+}
+
+internal sealed class AuthzV3Carrier
+{
+	[JsonPropertyName("data")]
+	public JsonElement Data { get; set; }
+	[JsonPropertyName("authz")]
+	public AuthzV3Envelope? Authz { get; set; }
 }

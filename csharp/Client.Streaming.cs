@@ -105,6 +105,12 @@ public partial class Client
         Action<UpdatePushEvent> onEvent,
         CancellationToken cancellationToken)
     {
+		RequireV3SecurityProfile();
+		if (string.IsNullOrWhiteSpace(SessionToken) || SessionExpiresAt <= DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+		{
+			throw InvalidAuthz("authorization session missing or expired for update stream");
+		}
+
         var query = new Dictionary<string, string?>
         {
             ["device_id"] = deviceId,
@@ -131,15 +137,13 @@ public partial class Client
         using var stream = await res.Content.ReadAsStreamAsync().ConfigureAwait(false);
         using var reader = new StreamReader(stream);
         var message = new SseMessage();
-        // When RequireAuthz, ignore pushed events until the stream proves it comes
-        // from the real server via a valid signed authz event.
-        var authzOk = !RequireAuthz;
-        while (!reader.EndOfStream && !cancellationToken.IsCancellationRequested)
+		var authzVerified = false;
+        while (!cancellationToken.IsCancellationRequested)
         {
             var line = await reader.ReadLineAsync().ConfigureAwait(false);
             if (line == null)
             {
-                continue;
+				throw new IOException("update stream closed by server");
             }
             if (line.StartsWith(":", StringComparison.Ordinal))
             {
@@ -147,7 +151,7 @@ public partial class Client
             }
             if (line.Length == 0)
             {
-                HandleSseMessage(message, options, onEvent, nonce, ref authzOk);
+                FlushMessage(message, options, onEvent, nonce, ref authzVerified);
                 message = new SseMessage();
                 continue;
             }
@@ -170,9 +174,19 @@ public partial class Client
                 message.Data.Append(line.Substring(5).Trim());
             }
         }
+
+		if (!authzVerified && !cancellationToken.IsCancellationRequested)
+        {
+            throw new SwmUnauthorizedException(401, ApiErrorCodeAuthzInvalid, "authorization missing from update stream");
+        }
     }
 
-    private void HandleSseMessage(SseMessage message, UpdateStreamOptions options, Action<UpdatePushEvent> onEvent, string requestNonce, ref bool authzOk)
+    private void FlushMessage(
+        SseMessage message,
+        UpdateStreamOptions options,
+        Action<UpdatePushEvent> onEvent,
+        string requestNonce,
+        ref bool authzVerified)
     {
         if (message.Data.Length == 0)
         {
@@ -184,26 +198,31 @@ public partial class Client
         }
 
         var payload = message.Data.ToString();
-
-        // The server emits a signed authz verdict as the first event. When
-        // RequireAuthz, verify it (throws to fail closed) before trusting any
-        // pushed event; ignore everything until it is verified.
+		if (string.Equals(message.EventName, "authz_expired", StringComparison.OrdinalIgnoreCase) ||
+			string.Equals(message.EventName, "authz-expired", StringComparison.OrdinalIgnoreCase))
+		{
+			throw new SwmUnauthorizedException(401, ApiErrorCodeAuthzInvalid, "authorization session expired");
+		}
         if (string.Equals(message.EventName, "authz", StringComparison.OrdinalIgnoreCase))
         {
-            if (RequireAuthz)
-            {
-                var env = JsonSerializer.Deserialize(payload, SwmJsonContext.Default.AuthzEnvelope);
-                VerifyAuthzOrThrow(env, requestNonce);
-                authzOk = true;
-            }
+			var authzCarrier = JsonSerializer.Deserialize(payload, SwmJsonContext.Default.AuthzV3Carrier)
+				?? throw InvalidAuthz("stream authorization missing");
+			VerifyAuthzV3OrThrow(authzCarrier.Authz, requestNonce, Encoding.UTF8.GetBytes(authzCarrier.Data.GetRawText()));
+            authzVerified = true;
             return;
         }
-        if (!authzOk)
+
+        if (!authzVerified)
         {
             return;
         }
 
-        var evt = JsonSerializer.Deserialize(payload, SwmJsonContext.Default.UpdatePushEvent);
+		var carrier = JsonSerializer.Deserialize(payload, SwmJsonContext.Default.AuthzV3Carrier)
+			?? throw InvalidAuthz("signed stream event missing");
+		var rawData = Encoding.UTF8.GetBytes(carrier.Data.GetRawText());
+		VerifyAuthzV3OrThrow(carrier.Authz, requestNonce, rawData);
+		payload = carrier.Data.GetRawText();
+		var evt = JsonSerializer.Deserialize(payload, SwmJsonContext.Default.UpdatePushEvent);
         if (evt == null)
         {
             return;

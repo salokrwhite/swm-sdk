@@ -305,24 +305,5 @@ public partial class Client
         return payload.Release;
     }
 
-    public async Task<List<AppSecretDto>> ListAppSecretsAsync(string appId, CancellationToken cancellationToken = default)
-    {
-        using var response = await DoAuthJsonAsync(HttpMethod.Get, $"/api/apps/{appId}/app-secrets", cancellationToken: cancellationToken).ConfigureAwait(false);
-        var payload = await DeserializeDataAsync(response, SwmJsonContext.Default.ListResponseAppSecretDto, cancellationToken).ConfigureAwait(false);
-        return payload.Items;
-    }
-
-    public async Task<AppSecretCreateResponse> CreateAppSecretAsync(string appId, DynamicRequest request, CancellationToken cancellationToken = default)
-    {
-        var body = JsonDefaults.ToJsonContent(request, SwmJsonContext.Default.DynamicRequest);
-        using var response = await DoAuthJsonAsync(HttpMethod.Post, $"/api/apps/{appId}/app-secrets", body, cancellationToken: cancellationToken).ConfigureAwait(false);
-        return await DeserializeDataAsync(response, SwmJsonContext.Default.AppSecretCreateResponse, cancellationToken).ConfigureAwait(false);
-    }
-
-    public async Task RevokeAppSecretAsync(string keyId, CancellationToken cancellationToken = default)
-    {
-        using var response = await DoAuthJsonAsync(HttpMethod.Delete, $"/api/app-secrets/{keyId}", cancellationToken: cancellationToken).ConfigureAwait(false);
-        await SwmErrorParser.ThrowIfErrorAsync(response, cancellationToken).ConfigureAwait(false);
-    }
     public Task<string> GetArtifactDownloadURLAsync(string artifactId, CancellationToken cancellationToken = default) => GetArtifactDownloadUrlAsync(artifactId, cancellationToken);
 }

@@ -12,6 +12,12 @@ public partial class Client
     private const string SignHeaderSignature = "X-Signature";
     private const string SignHeaderVersion = "X-Sign-Version";
     private const string SignVersion = "v1";
+    private const string AuthzCapabilityHeader = "X-Authz-Capability";
+	private const string ClientReleaseIdHeader = "X-Client-Release-Id";
+	private const string ClientVersionHeader = "X-Client-Version";
+	private const string ClientVersionCodeHeader = "X-Client-Version-Code";
+	private const string SwmSessionHeader = "X-SWM-Session";
+	private const string SwmDpopHeader = "X-SWM-DPoP";
 
     private static string QueryEscapeRfc3986(string value)
     {
@@ -135,26 +141,65 @@ public partial class Client
         });
     }
 
-    private static void SetCommonSignatureHeaders(HttpRequestMessage request, long timestamp, string nonce, string signature)
+    private static void SetRequestBindingHeaders(HttpRequestMessage request, long timestamp, string nonce)
     {
         request.Headers.TryAddWithoutValidation(SignHeaderTimestamp, timestamp.ToString());
         request.Headers.TryAddWithoutValidation(SignHeaderNonce, nonce);
+    }
+
+    private static void SetAuthSignatureHeaders(HttpRequestMessage request, long timestamp, string nonce, string signature)
+    {
+		SetRequestBindingHeaders(request, timestamp, nonce);
         request.Headers.TryAddWithoutValidation(SignHeaderSignature, signature);
         request.Headers.TryAddWithoutValidation(SignHeaderVersion, SignVersion);
     }
 
-    // SignClientRequest signs the request and returns the nonce it used, so callers
-    // can verify a server response (authz verdict) is bound to this challenge.
     private string SignClientRequest(HttpRequestMessage request, byte[] bodyBytes)
     {
-        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var nonce = Guid.NewGuid().ToString();
-        var canonical = BuildCanonical(request, bodyBytes, timestamp, nonce, AppId);
-        var signature = HmacSHA256Hex(AppSecret, canonical);
-        request.Headers.TryAddWithoutValidation(SignHeaderAppId, AppId);
-        SetCommonSignatureHeaders(request, timestamp, nonce, signature);
-        return nonce;
+		if (AuthzV3Required)
+		{
+			var profile = SecurityProfile!;
+			var native = NativeSecurityContext ?? throw InvalidAuthz("MySwm native security context is required for Authz v3");
+			var operation = ResolveNativeOperation(request);
+			string v3Nonce;
+			if (operation == MySwmOperation.UpdateCheck)
+			{
+				var auth = native.CreateUpdateAuth(bodyBytes);
+				v3Nonce = auth.Nonce;
+				SetRequestBindingHeaders(request, auth.Timestamp, auth.Nonce);
+			}
+			else
+			{
+				v3Nonce = Guid.NewGuid().ToString();
+				SetRequestBindingHeaders(request, DateTimeOffset.UtcNow.ToUnixTimeSeconds(), v3Nonce);
+			}
+			request.Headers.TryAddWithoutValidation(SignHeaderAppId, AppId);
+			request.Headers.TryAddWithoutValidation(AuthzCapabilityHeader, profile.Protocol);
+			request.Headers.TryAddWithoutValidation(ClientReleaseIdHeader, profile.ReleaseId);
+			request.Headers.TryAddWithoutValidation(ClientVersionHeader, profile.Version);
+			request.Headers.TryAddWithoutValidation(ClientVersionCodeHeader, profile.VersionCode?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty);
+			if (!string.IsNullOrWhiteSpace(SessionToken)) request.Headers.TryAddWithoutValidation(SwmSessionHeader, SessionToken);
+			var resourceId = operation == MySwmOperation.UpdateStream ? request.RequestUri?.AbsoluteUri : null;
+			request.Headers.TryAddWithoutValidation(SwmDpopHeader, native.CreateProof(operation, bodyBytes, resourceId));
+			return v3Nonce;
+		}
+		throw InvalidAuthz("Authz v3 security profile is required");
     }
+
+	private static MySwmOperation ResolveNativeOperation(HttpRequestMessage request)
+	{
+		var path = request.RequestUri?.AbsolutePath ?? string.Empty;
+		return path switch
+		{
+			"/api/client/update-check" => MySwmOperation.UpdateCheck,
+			"/api/client/heartbeat" => MySwmOperation.Heartbeat,
+			"/api/client/events" => MySwmOperation.Events,
+			"/api/client/feedback" => MySwmOperation.Feedback,
+			"/api/client/enrollment-ticket" => MySwmOperation.EnrollmentTicket,
+			"/api/client/updates/stream" => MySwmOperation.UpdateStream,
+			_ => throw InvalidAuthz("request path is not allowed by MySwm")
+		};
+	}
 
     private void SignAuthRequest(HttpRequestMessage request, byte[] bodyBytes, string rawToken)
     {
@@ -167,6 +212,6 @@ public partial class Client
         var nonce = Guid.NewGuid().ToString();
         var canonical = BuildCanonical(request, bodyBytes, timestamp, nonce, sub);
         var signature = HmacSHA256Hex(rawToken, canonical);
-        SetCommonSignatureHeaders(request, timestamp, nonce, signature);
+        SetAuthSignatureHeaders(request, timestamp, nonce, signature);
     }
 }

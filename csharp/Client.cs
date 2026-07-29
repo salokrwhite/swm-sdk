@@ -14,11 +14,10 @@ public partial class Client
     public const string ControlEventMaintenanceCancelled = "maintenance_cancelled";
     public const string ApiErrorCodeDeviceBlocked = "device_blocked";
     public const string ApiErrorCodeUpdateRegionBlocked = "update_region_blocked";
-    public const string ApiErrorCodeFeedbackDisabled = "feedback_disabled";
+	public const string ApiErrorCodeFeedbackDisabled = "feedback_disabled";
 
     public string BaseUrl { get; }
     public string AppId { get; }
-    public string AppSecret { get; }
     public string AuthToken { get; private set; } = string.Empty;
     public string Channel { get; set; } = string.Empty;
     public string Platform { get; set; } = string.Empty;
@@ -29,18 +28,38 @@ public partial class Client
     public string? PublicKey { get; set; }
     public bool VerifySignature { get; set; }
     public Func<string, string, bool>? SignatureVerifier { get; set; }
+	public ReleaseSecurityProfile? SecurityProfile { get; }
+	public string SessionToken { get; private set; } = string.Empty;
+	public long SessionExpiresAt { get; private set; }
+	public MySwmContext? NativeSecurityContext { get; }
     public int Retries { get; set; } = 2;
     public TimeSpan Backoff { get; set; } = TimeSpan.FromMilliseconds(500);
     public HttpClient HttpClient { get; }
     internal static readonly HttpMethod PatchMethod = new("PATCH");
 
-    public Client(string baseUrl, string appId, string appSecret, HttpClient? httpClient = null)
+    public Client(string baseUrl, string appId, HttpClient? httpClient = null, ReleaseSecurityProfile? securityProfile = null, MySwmContext? nativeSecurityContext = null)
     {
         BaseUrl = baseUrl.TrimEnd('/');
         AppId = appId;
-        AppSecret = appSecret;
         HttpClient = httpClient ?? new HttpClient();
+		SecurityProfile = securityProfile;
+		NativeSecurityContext = nativeSecurityContext;
+		if (securityProfile != null && !string.IsNullOrWhiteSpace(securityProfile.KeyId))
+		{
+			AuthzPublicKeys[securityProfile.KeyId] = securityProfile.PublicKey;
+		}
     }
+
+	private bool AuthzV3Required => SecurityProfile != null && string.Equals(SecurityProfile.Protocol, "v3", StringComparison.Ordinal);
+
+	private ReleaseSecurityProfile RequireV3SecurityProfile()
+	{
+		if (!AuthzV3Required || SecurityProfile == null || NativeSecurityContext == null)
+		{
+			throw InvalidAuthz("Authz v3 security profile and native context are required");
+		}
+		return SecurityProfile;
+	}
 
     public void SetAuthToken(string token)
     {
@@ -121,40 +140,48 @@ public partial class Client
 
     private async Task<HttpResponseMessage> DoRequestAsync(HttpMethod method, string path, HttpContent? body = null, CancellationToken cancellationToken = default)
     {
-        var (resp, _) = await DoRequestCapturingNonceAsync(method, path, body, cancellationToken).ConfigureAwait(false);
-        return resp;
+        var (response, _) = await DoRequestCapturingNonceAsync(method, path, body, cancellationToken).ConfigureAwait(false);
+        return response;
     }
 
-    // DoRequestCapturingNonceAsync is identical to DoRequestAsync but also returns
-    // the X-Nonce that was actually sent on the successful attempt, so callers can
-    // verify a server response is cryptographically bound to that challenge.
-    private async Task<(HttpResponseMessage Response, string Nonce)> DoRequestCapturingNonceAsync(HttpMethod method, string path, HttpContent? body, CancellationToken cancellationToken)
+    private async Task<(HttpResponseMessage Response, string Nonce)> DoRequestCapturingNonceAsync(
+        HttpMethod method,
+        string path,
+        HttpContent? body = null,
+        CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrWhiteSpace(AppId) || string.IsNullOrWhiteSpace(AppSecret))
+		if (string.IsNullOrWhiteSpace(AppId))
         {
-            throw new SwmValidationException(400, null, "app_id and app_secret required");
+            throw new SwmValidationException(400, null, "app_id required");
         }
+
+		if (!AuthzV3Required || NativeSecurityContext == null)
+		{
+			throw InvalidAuthz("Authz v3 security profile and native context are required");
+		}
+
+		if (
+			!string.Equals(path, "/api/client/update-check", StringComparison.Ordinal) &&
+			(string.IsNullOrWhiteSpace(SessionToken) || SessionExpiresAt <= DateTimeOffset.UtcNow.ToUnixTimeSeconds()))
+		{
+			throw InvalidAuthz("authorization session missing or expired");
+		}
 
         var bodyBytes = body != null ? await body.ReadAsByteArrayAsync().ConfigureAwait(false) : Array.Empty<byte>();
         Exception? last = null;
         for (var attempt = 0; attempt <= Retries; attempt++)
         {
-            try
-            {
-                using var req = new HttpRequestMessage(method, $"{BaseUrl}{path}");
-                if (body != null)
-                {
-                    var clone = new ByteArrayContent(bodyBytes);
-                    foreach (var header in body.Headers)
-                    {
-                        clone.Headers.TryAddWithoutValidation(header.Key, header.Value);
-                    }
-                    req.Content = clone;
-                }
-                var nonce = SignClientRequest(req, bodyBytes);
-                var resp = await HttpClient.SendAsync(req, cancellationToken).ConfigureAwait(false);
-                return (resp, nonce);
-            }
+			try
+			{
+				using var req = new HttpRequestMessage(method, $"{BaseUrl}{path}");
+				var nonce = SignClientRequest(req, bodyBytes);
+				if (body != null)
+				{
+					req.Content = CreateRequestContent(req, body, bodyBytes);
+				}
+				var resp = await HttpClient.SendAsync(req, cancellationToken).ConfigureAwait(false);
+				return (resp, nonce);
+			}
             catch (Exception ex)
             {
                 last = ex;
@@ -214,31 +241,73 @@ public partial class Client
         throw last ?? new SwmApiException(0, null, "request failed");
     }
 
-    public async Task<UpdateCheckResponse> CheckUpdateAsync(string currentVersion, int? versionCode = null, string? userId = null, CancellationToken cancellationToken = default)
-    {
+	public async Task<UpdateCheckResponse> CheckUpdateAsync(string currentVersion, int? versionCode = null, string? userId = null, CancellationToken cancellationToken = default)
+	{
+		var securityProfile = RequireV3SecurityProfile();
+		if (!string.Equals(currentVersion, securityProfile.Version, StringComparison.Ordinal))
+		{
+			throw new SwmValidationException(400, ApiErrorCodeAuthzInvalid, "current version does not match the release security profile");
+		}
         var effectiveUserId = string.IsNullOrWhiteSpace(userId) ? UserId : userId;
         var payload = new UpdateCheckRequest
         {
             ChannelCode = Channel,
             CurrentVersion = currentVersion,
-            VersionCode = versionCode,
+			VersionCode = securityProfile.VersionCode,
             Platform = Platform,
             Arch = Arch,
             DeviceId = DeviceId,
             UserId = string.IsNullOrWhiteSpace(effectiveUserId) ? null : effectiveUserId,
             Attributes = JsonDefaults.ToJsonElementMap(Attributes)
         };
-        var (res, requestNonce) = await DoRequestCapturingNonceAsync(HttpMethod.Post, "/api/client/update-check", JsonDefaults.ToJsonContent(payload, SwmJsonContext.Default.UpdateCheckRequest), cancellationToken).ConfigureAwait(false);
+		var native = NativeSecurityContext!;
+		var identity = native.GetIdentity();
+		payload.DeviceAuth = new DeviceAuthRegistration
+		{
+			InstallId = identity.InstallId,
+			KeyId = identity.KeyId,
+			KeyThumbprint = identity.KeyThumbprint,
+			PublicKeySec1 = identity.PublicKeySec1
+		};
+        var (res, nonce) = await DoRequestCapturingNonceAsync(
+            HttpMethod.Post,
+            "/api/client/update-check",
+            JsonDefaults.ToJsonContent(payload, SwmJsonContext.Default.UpdateCheckRequest),
+            cancellationToken).ConfigureAwait(false);
+		if ((int)res.StatusCode == 428)
+		{
+			using (res)
+			{
+				var challenge = await JsonDefaults.DeserializeAsync(
+					res.Content, SwmJsonContext.Default.DeviceRegistrationChallengeResponse, cancellationToken).ConfigureAwait(false);
+				if (string.IsNullOrWhiteSpace(challenge.Challenge) || payload.DeviceAuth == null)
+				{
+					throw InvalidAuthz("device registration challenge missing");
+				}
+				payload.DeviceAuth.Challenge = challenge.Challenge;
+			}
+			(res, nonce) = await DoRequestCapturingNonceAsync(
+				HttpMethod.Post,
+				"/api/client/update-check",
+				JsonDefaults.ToJsonContent(payload, SwmJsonContext.Default.UpdateCheckRequest),
+				cancellationToken).ConfigureAwait(false);
+		}
         using (res)
         {
             await SwmErrorParser.ThrowIfErrorAsync(res, cancellationToken).ConfigureAwait(false);
-            var data = await JsonDefaults.DeserializeAsync(res.Content, SwmJsonContext.Default.UpdateCheckResponse, cancellationToken).ConfigureAwait(false);
-
-            // Fail closed: when RequireAuthz, the response must carry a valid signed
-            // "allow" bound to this request's nonce and this device.
-            VerifyAuthzOrThrow(data.Authz, requestNonce);
-
-            if (!string.IsNullOrWhiteSpace(data.Signature) && !string.IsNullOrWhiteSpace(data.ChecksumSha256))
+			var raw = await res.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+			var carrier = JsonSerializer.Deserialize(raw, SwmJsonContext.Default.AuthzV3Carrier)
+				?? throw InvalidAuthz("Authz v3 update response missing");
+			var dataRaw = Encoding.UTF8.GetBytes(carrier.Data.GetRawText());
+			VerifyAuthzV3OrThrow(carrier.Authz, nonce, dataRaw);
+			var data = JsonSerializer.Deserialize(dataRaw, SwmJsonContext.Default.UpdateCheckResponse)
+				?? throw InvalidAuthz("Authz v3 update data missing");
+			if (data.UpdateAvailable &&
+				!data.OpenInBrowser && !string.Equals(data.DeliveryMethod, "external_link", StringComparison.OrdinalIgnoreCase))
+			{
+				VerifyArtifactManifestOrThrow(data);
+			}
+			else if (!string.IsNullOrWhiteSpace(data.Signature) && !string.IsNullOrWhiteSpace(data.ChecksumSha256))
             {
                 if (!VerifySignatureInternal(data.ChecksumSha256!, data.Signature!))
                 {
@@ -260,7 +329,11 @@ public partial class Client
             Properties = properties != null ? JsonDefaults.ToJsonElementMap(properties) : new Dictionary<string, JsonElement>(),
             Attributes = JsonDefaults.ToJsonElementMap(Attributes)
         };
-        var (res, nonce) = await DoRequestCapturingNonceAsync(HttpMethod.Post, "/api/client/events", JsonDefaults.ToJsonContent(payload, SwmJsonContext.Default.EventIngestItem), cancellationToken).ConfigureAwait(false);
+        var (res, nonce) = await DoRequestCapturingNonceAsync(
+            HttpMethod.Post,
+            "/api/client/events",
+            JsonDefaults.ToJsonContent(payload, SwmJsonContext.Default.EventIngestItem),
+            cancellationToken).ConfigureAwait(false);
         using (res)
         {
             await SwmErrorParser.ThrowIfErrorAsync(res, cancellationToken).ConfigureAwait(false);
@@ -274,7 +347,11 @@ public partial class Client
         {
             Events = events
         };
-        var (res, nonce) = await DoRequestCapturingNonceAsync(HttpMethod.Post, "/api/client/events", JsonDefaults.ToJsonContent(payload, SwmJsonContext.Default.EventBatchRequest), cancellationToken).ConfigureAwait(false);
+        var (res, nonce) = await DoRequestCapturingNonceAsync(
+            HttpMethod.Post,
+            "/api/client/events",
+            JsonDefaults.ToJsonContent(payload, SwmJsonContext.Default.EventBatchRequest),
+            cancellationToken).ConfigureAwait(false);
         using (res)
         {
             await SwmErrorParser.ThrowIfErrorAsync(res, cancellationToken).ConfigureAwait(false);
@@ -300,7 +377,11 @@ public partial class Client
             Attributes = Attributes.Count > 0 ? JsonDefaults.ToJsonElementMap(Attributes) : null
         };
 
-        var (res, nonce) = await DoRequestCapturingNonceAsync(HttpMethod.Post, "/api/client/heartbeat", JsonDefaults.ToJsonContent(payload, SwmJsonContext.Default.HeartbeatRequest), cancellationToken).ConfigureAwait(false);
+        var (res, nonce) = await DoRequestCapturingNonceAsync(
+            HttpMethod.Post,
+            "/api/client/heartbeat",
+            JsonDefaults.ToJsonContent(payload, SwmJsonContext.Default.HeartbeatRequest),
+            cancellationToken).ConfigureAwait(false);
         using (res)
         {
             await SwmErrorParser.ThrowIfErrorAsync(res, cancellationToken).ConfigureAwait(false);
@@ -319,7 +400,11 @@ public partial class Client
         using var form = formResult.Form;
         try
         {
-            var (res, nonce) = await DoRequestCapturingNonceAsync(HttpMethod.Post, "/api/client/feedback", form, cancellationToken).ConfigureAwait(false);
+            var (res, nonce) = await DoRequestCapturingNonceAsync(
+                HttpMethod.Post,
+                "/api/client/feedback",
+                form,
+                cancellationToken).ConfigureAwait(false);
             using (res)
             {
                 await SwmErrorParser.ThrowIfErrorAsync(res, cancellationToken).ConfigureAwait(false);
@@ -337,42 +422,51 @@ public partial class Client
 
     public async Task DownloadAsync(string url, string destPath, string? checksum = null, string? signature = null, Action<long, long>? progress = null, CancellationToken cancellationToken = default)
     {
-        using var req = new HttpRequestMessage(HttpMethod.Get, url);
-        using var res = await HttpClient.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
-        await SwmErrorParser.ThrowIfErrorAsync(res, cancellationToken).ConfigureAwait(false);
-
         var directory = Path.GetDirectoryName(destPath);
         if (!string.IsNullOrWhiteSpace(directory))
         {
             Directory.CreateDirectory(directory);
         }
 
-        using var source = await res.Content.ReadAsStreamAsync().ConfigureAwait(false);
-        using var target = File.Create(destPath);
-        using var sha = SHA256.Create();
+		var partialPath = destPath + ".part";
+		Exception? lastError = null;
+		for (var attempt = 0; attempt <= Retries; attempt++)
+		{
+			try
+			{
+				await DownloadRangeAsync(url, partialPath, progress, cancellationToken).ConfigureAwait(false);
+				lastError = null;
+				break;
+			}
+			catch (Exception ex) when (ex is HttpRequestException || ex is IOException)
+			{
+				lastError = ex;
+				if (attempt >= Retries)
+				{
+					break;
+				}
+				var delay = TimeSpan.FromMilliseconds(Backoff.TotalMilliseconds * Math.Pow(2, attempt));
+				await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+			}
+		}
+		if (lastError != null)
+		{
+			throw lastError;
+		}
 
-        var buffer = new byte[32 * 1024];
-        long written = 0;
-        var total = res.Content.Headers.ContentLength ?? 0;
-        while (true)
-        {
-            var read = await source.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false);
-            if (read == 0)
-            {
-                break;
-            }
-            await target.WriteAsync(buffer, 0, read, cancellationToken).ConfigureAwait(false);
-            sha.TransformBlock(buffer, 0, read, null, 0);
-            written += read;
-            progress?.Invoke(written, total);
-        }
-        sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+		byte[] hash;
+		using (var sha = SHA256.Create())
+		using (var file = File.OpenRead(partialPath))
+		{
+			hash = sha.ComputeHash(file);
+		}
 
         if (!string.IsNullOrWhiteSpace(checksum))
         {
-            var got = HexLower(sha.Hash ?? Array.Empty<byte>());
+			var got = HexLower(hash);
             if (!string.Equals(got, checksum, StringComparison.OrdinalIgnoreCase))
             {
+				File.Delete(partialPath);
                 throw new SwmApiException(0, null, $"checksum mismatch: {got} != {checksum}");
             }
         }
@@ -384,5 +478,68 @@ public partial class Client
                 throw new SwmApiException(0, null, "signature verification failed");
             }
         }
+
+		if (File.Exists(destPath))
+		{
+			File.Delete(destPath);
+		}
+		File.Move(partialPath, destPath);
     }
+
+	private async Task DownloadRangeAsync(
+		string url,
+		string partialPath,
+		Action<long, long>? progress,
+		CancellationToken cancellationToken)
+	{
+		var existingLength = File.Exists(partialPath) ? new FileInfo(partialPath).Length : 0;
+		using var req = new HttpRequestMessage(HttpMethod.Get, url);
+		if (existingLength > 0)
+		{
+			req.Headers.Range = new RangeHeaderValue(existingLength, null);
+		}
+		RequireV3SecurityProfile();
+		if (string.IsNullOrWhiteSpace(SessionToken) || SessionExpiresAt <= DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+		{
+			throw InvalidAuthz("authorization session missing or expired for download");
+		}
+		req.Headers.TryAddWithoutValidation("X-SWM-Session", SessionToken);
+		req.Headers.TryAddWithoutValidation("X-SWM-DPoP", NativeSecurityContext!.CreateProof(MySwmOperation.Download, Array.Empty<byte>(), url));
+
+		using var res = await HttpClient.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+		await SwmErrorParser.ThrowIfErrorAsync(res, cancellationToken).ConfigureAwait(false);
+		var append = existingLength > 0 && res.StatusCode == System.Net.HttpStatusCode.PartialContent;
+		if (!append)
+		{
+			existingLength = 0;
+		}
+		var expectedTotal = res.Content.Headers.ContentRange?.Length ??
+			(res.Content.Headers.ContentLength.HasValue ? existingLength + res.Content.Headers.ContentLength.Value : 0);
+		using var source = await res.Content.ReadAsStreamAsync().ConfigureAwait(false);
+		using var target = new FileStream(
+			partialPath,
+			append ? FileMode.Append : FileMode.Create,
+			FileAccess.Write,
+			FileShare.None,
+			32 * 1024,
+			useAsync: true);
+		var buffer = new byte[32 * 1024];
+		var written = existingLength;
+		progress?.Invoke(written, expectedTotal);
+		while (true)
+		{
+			var read = await source.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false);
+			if (read == 0)
+			{
+				break;
+			}
+			await target.WriteAsync(buffer, 0, read, cancellationToken).ConfigureAwait(false);
+			written += read;
+			progress?.Invoke(written, expectedTotal);
+		}
+		if (expectedTotal > 0 && written != expectedTotal)
+		{
+			throw new IOException($"download length mismatch: {written} != {expectedTotal}");
+		}
+	}
 }

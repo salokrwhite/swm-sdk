@@ -4,8 +4,9 @@
 
 ## Target Frameworks
 
+- `net10.0`
 - `net8.0`
-- `netstandard2.0`
+- `netstandard2.0`（可由 Windows 7 SP1 上的 .NET Framework 4.8 宿主使用）
 
 ## Core Features
 
@@ -13,14 +14,18 @@
 - Device shutdown control event (`device_shutdown`)
 - Device blocked contract (`error.code = device_blocked`)
 - Heartbeat / events / feedback / download
-- Full management APIs aligned with Go SDK
+- Full management APIs
 
 ## Quick Start
 
 ```csharp
 using SwmSdk;
 
-var client = new Client("http://localhost:8080", "your_app_id", "your_app_secret")
+using var native = MySwmContext.Create("device-001");
+var profile = new ReleaseSecurityProfile(
+    "release_id", "1.0.0", 100, "v3", "server_key_id", "server_public_key");
+var client = new Client("http://localhost:8080", "your_app_id",
+    securityProfile: profile, nativeSecurityContext: native)
 {
     Channel = "stable",
     Platform = "windows",
@@ -30,6 +35,36 @@ var client = new Client("http://localhost:8080", "your_app_id", "your_app_secret
 
 var update = await client.CheckUpdateAsync("1.0.0", 100);
 ```
+
+## Authz v3 / MySwm.dll
+
+安全 Release 必须使用与进程架构一致的 `MySwm.dll`。NuGet 包将原生文件放在
+`runtimes/win-x86/native` 和 `runtimes/win-x64/native`；打包时若缺少任一架构会直接失败。
+
+`MySwmContext` 不再公开通用 `CreateDpop(...)`。对外仅保留固定用途方法：
+`CreateFirmwareIdentityProof`、`CreateDebugCreateProof`、`CreateDebugCancelProof`、
+`CreateDebugStreamProof`；SDK 内部继续为 update-check / heartbeat / events / feedback /
+enrollment / download / SSE 使用固定 proof 路径。
+
+当前 `MySwm` ABI 为 `0x00010005`。
+
+```csharp
+using var native = MySwmContext.Create(pcid);
+var profile = new ReleaseSecurityProfile(
+    releaseId, version, versionCode, "v3", serverKeyId, serverEd25519PublicKey);
+var client = new Client(baseUrl, appId, securityProfile: profile,
+    nativeSecurityContext: native)
+{
+    Channel = "stable",
+    Platform = "windows",
+    Arch = Environment.Is64BitProcess ? "x64" : "x86",
+    DeviceId = pcid
+};
+```
+
+`MySwm.dll` 持有每安装 CNG P-256 私钥、DPAPI 元数据、短期 Session 和 DPoP
+状态，并在 Native 内验证服务端 Ed25519 裁决。Session 到期只禁用云功能；明确的
+撤销、封禁或验签失败应由宿主走安全关闭路径。
 
 ## Signature Verification
 

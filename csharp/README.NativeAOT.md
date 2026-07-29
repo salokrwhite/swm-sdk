@@ -12,7 +12,7 @@
 
 ```xml
 <PropertyGroup>
-  <TargetFramework>net8.0</TargetFramework>
+  <TargetFramework>net10.0</TargetFramework>
   <PublishAot>true</PublishAot>
   <InvariantGlobalization>true</InvariantGlobalization>
 </PropertyGroup>
@@ -23,7 +23,11 @@
 ```csharp
 using SwmSdk;
 
-var client = new Client("http://localhost:8080", "app_id", "app_secret")
+using var native = MySwmContext.Create("device-001");
+var profile = new ReleaseSecurityProfile(
+    "release_id", "1.0.0", 100, "v3", "server_key_id", "server_public_key");
+var client = new Client("http://localhost:8080", "app_id",
+    securityProfile: profile, nativeSecurityContext: native)
 {
     Channel = "stable",
     Platform = "windows",
@@ -45,6 +49,10 @@ catch (SwmDeviceBlockedException)
 
 若启用 `VerifySignature=true` 且设置了 `PublicKey`，SDK 会自动执行 Ed25519 验签。  
 如果你需要自定义验签实现（例如接入 HSM），可设置 `SignatureVerifier` 回调覆盖默认行为。
+
+Authz v3 不使用该可替换回调作为信任根；服务端裁决由同架构 `MySwm.dll` 内的
+固定 Ed25519 验证器校验。NativeAOT `win-x86` 只能加载 x86 DLL，`win-x64` 只能
+加载 x64 DLL。
 
 ## SSE 下线控制事件
 
