@@ -48,6 +48,14 @@ public partial class Client
         return payload.Channel;
     }
 
+    public async Task<ChannelDto> UpdateChannelAsync(string appId, string channelId, DynamicRequest request, CancellationToken cancellationToken = default)
+    {
+        var body = JsonDefaults.ToJsonContent(request, SwmJsonContext.Default.DynamicRequest);
+        using var response = await DoAuthJsonAsync(PatchMethod, $"/api/apps/{appId}/channels/{channelId}", body, cancellationToken: cancellationToken).ConfigureAwait(false);
+        var payload = await DeserializeDataAsync(response, SwmJsonContext.Default.ChannelResponse, cancellationToken).ConfigureAwait(false);
+        return payload.Channel;
+    }
+
     public async Task<List<AppMemberDto>> ListAppMembersAsync(string appId, CancellationToken cancellationToken = default)
     {
         using var response = await DoAuthJsonAsync(HttpMethod.Get, $"/api/apps/{appId}/members", cancellationToken: cancellationToken).ConfigureAwait(false);

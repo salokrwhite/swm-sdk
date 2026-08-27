@@ -35,10 +35,21 @@ public sealed class SwmFeedbackDisabledException : SwmApiException
     }
 }
 
-public sealed class SwmUnauthorizedException : SwmApiException
+public class SwmUnauthorizedException : SwmApiException
 {
     public SwmUnauthorizedException(int statusCode, string? errorCode, string message) : base(statusCode, errorCode, message)
     {
+    }
+}
+
+public sealed class SwmUnsupportedVersionException : SwmUnauthorizedException
+{
+    public string MinimumSupportedVersion { get; }
+
+    public SwmUnsupportedVersionException(int statusCode, string message, string? minimumSupportedVersion)
+        : base(statusCode, Client.ApiErrorCodeClientVersionUnsupported, message)
+    {
+        MinimumSupportedVersion = minimumSupportedVersion?.Trim() ?? string.Empty;
     }
 }
 
@@ -62,6 +73,7 @@ internal static class SwmErrorParser
         var raw = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
         var message = response.ReasonPhrase ?? "request failed";
         string? code = null;
+        string? minimumSupportedVersion = null;
 
         if (!string.IsNullOrWhiteSpace(raw))
         {
@@ -88,6 +100,10 @@ internal static class SwmErrorParser
                         {
                             message = code!;
                         }
+                        if (err.TryGetProperty("minimum_supported_version", out var minimumNode) && minimumNode.ValueKind == JsonValueKind.String)
+                        {
+                            minimumSupportedVersion = minimumNode.GetString();
+                        }
                     }
                 }
                 else
@@ -108,6 +124,10 @@ internal static class SwmErrorParser
         if (string.Equals(code, Client.ApiErrorCodeUpdateRegionBlocked, StringComparison.OrdinalIgnoreCase))
         {
             throw new SwmUpdateRegionBlockedException(statusCode, message);
+        }
+        if (string.Equals(code, Client.ApiErrorCodeClientVersionUnsupported, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new SwmUnsupportedVersionException(statusCode, message, minimumSupportedVersion);
         }
         if (string.Equals(code, Client.ApiErrorCodeFeedbackDisabled, StringComparison.OrdinalIgnoreCase))
         {

@@ -13,7 +13,7 @@ public partial class Client
 
     private const int MaxAuthzLifetimeSeconds = 15 * 60;
 
-    public Dictionary<string, string> AuthzPublicKeys { get; } = new(StringComparer.Ordinal);
+    public Dictionary<string, string> OnlinePublicKeys { get; } = new(StringComparer.Ordinal);
 
     public int AuthzClockSkewSeconds { get; set; } = 120;
 
@@ -59,12 +59,12 @@ public partial class Client
 		{
 			// update-check 的整个 data 已由当前 Release 的固定信任 Key 签名，
 			// 因此可用它安全承载目标 Release 的轮换公钥。
-			AuthzPublicKeys[keyId] = responsePublicKey;
+			OnlinePublicKeys[keyId] = responsePublicKey;
 		}
 		if (string.IsNullOrWhiteSpace(update.ReleaseId) || string.IsNullOrWhiteSpace(update.Version) ||
 			string.IsNullOrWhiteSpace(update.ChecksumSha256) || string.IsNullOrWhiteSpace(update.Signature) ||
 			string.IsNullOrWhiteSpace(update.ArtifactPlatform) || string.IsNullOrWhiteSpace(update.ArtifactArch) ||
-			!AuthzPublicKeys.TryGetValue(keyId, out var publicKey))
+			!OnlinePublicKeys.TryGetValue(keyId, out var publicKey))
 		{
 			throw InvalidAuthz("signed artifact manifest incomplete or key unknown");
 		}

@@ -14,6 +14,7 @@ public partial class Client
     public const string ControlEventMaintenanceCancelled = "maintenance_cancelled";
     public const string ApiErrorCodeDeviceBlocked = "device_blocked";
     public const string ApiErrorCodeUpdateRegionBlocked = "update_region_blocked";
+	public const string ApiErrorCodeClientVersionUnsupported = "client_version_unsupported";
 	public const string ApiErrorCodeFeedbackDisabled = "feedback_disabled";
 
     public string BaseUrl { get; }
@@ -44,10 +45,6 @@ public partial class Client
         HttpClient = httpClient ?? new HttpClient();
 		SecurityProfile = securityProfile;
 		NativeSecurityContext = nativeSecurityContext;
-		if (securityProfile != null && !string.IsNullOrWhiteSpace(securityProfile.KeyId))
-		{
-			AuthzPublicKeys[securityProfile.KeyId] = securityProfile.PublicKey;
-		}
     }
 
 	private bool AuthzV3Required => SecurityProfile != null && string.Equals(SecurityProfile.Protocol, "v3", StringComparison.Ordinal);
