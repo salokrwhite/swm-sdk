@@ -2,7 +2,10 @@
 
 This repository contains the standalone Software Web Manager client SDK.
 
-The supported SDK is the pure managed C# implementation under `CSharp/`.
-It targets .NET 10 on Windows x86/x64 and does not require a custom native DLL.
+Supported SDK implementations:
 
-See [`CSharp/README.md`](CSharp/README.md) for usage and build instructions.
+- `CSharp/`: pure managed .NET 10 on Windows x86/x64.
+- `Cpp/`: pure C++20 static library on Windows x86/x64.
+- `Java/`: Java 17 Windows desktop SDK using JNA for system CNG/DPAPI APIs.
+
+See each SDK directory's `README.md` for usage and build instructions.
