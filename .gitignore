@@ -227,4 +227,4 @@ release/
 dist/
 artifacts/
 
-csharp/tests/
+CSharp/tests/
