@@ -226,3 +226,5 @@ ui_*.h
 release/
 dist/
 artifacts/
+
+csharp/tests/
