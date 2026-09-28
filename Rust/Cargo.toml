@@ -1,0 +1,61 @@
+[package]
+name = "swm-sdk"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Windows desktop client SDK for Software Web Manager"
+repository = "https://github.com/salokrwhite/swm-sdk"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "swm_sdk"
+path = "src/lib.rs"
+
+[dependencies]
+aes-gcm = "0.10"
+async-trait = "0.1"
+base64 = "0.22"
+curve25519-dalek = "4"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+eventsource-stream = "0.2"
+futures-util = "0.3"
+hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
+httpdate = "1"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "io-util", "time", "sync"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+zeroize = { version = "1", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "native-tls", "http2"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+] }
+winreg = "0.55"
+
+[target.'cfg(not(windows))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls", "http2"] }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"
