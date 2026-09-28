@@ -100,24 +100,19 @@ internal sealed class HostIntegrityManager
             foreach (var file in manifest.Files)
             {
                 var fullPath = ResolveSafePath(GetPackageRoot(), file.Path);
-                var info = new FileInfo(fullPath);
-                if (!info.Exists || (ulong)info.Length != file.Size)
+                try
                 {
-                    throw new SwmIntegrityException(
-                        0,
-                        "host_bundle_incomplete",
-                        $"protected file is missing or has the wrong size: {file.Path}",
-                        IntegrityFailureAction.ShutdownClient);
+                    _ = File.GetAttributes(fullPath);
+                }
+                catch (FileNotFoundException)
+                {
+                    continue;
+                }
+                catch (DirectoryNotFoundException)
+                {
+                    continue;
                 }
                 var hash = await HashFileAsync(fullPath, cancellationToken).ConfigureAwait(false);
-                if (!CryptographicOperations.FixedTimeEquals(hash, file.Sha256))
-                {
-                    throw new SwmIntegrityException(
-                        0,
-                        "host_executable_mismatch",
-                        $"protected file hash mismatch: {file.Path}",
-                        IntegrityFailureAction.ShutdownClient);
-                }
                 files[NormalizeRelativePath(file.Path)] = Convert.ToHexString(hash).ToLowerInvariant();
             }
             return IntegrityEvidence.Verified(manifest.ManifestSha256, files);

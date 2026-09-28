@@ -63,7 +63,10 @@ installations intentionally register as new devices.
 Enable `SwmClientOptions.HostIntegrity` and set `PackageRoot` when the Release
 uses `host_integrity_required`. By default the SDK reads
 `release-integrity.v2` relative to the package root. Applications can replace
-the built-in scanner with `IIntegrityEvidenceProvider`.
+the built-in scanner with `IIntegrityEvidenceProvider`. The built-in scanner
+reports actual hashes for present manifest files and omits missing files so the
+server can enforce the signed Release policy's required, optional, and ignored
+paths.
 
 ## Generic Operation Authorization
 
