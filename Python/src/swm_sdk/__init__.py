@@ -1,0 +1,76 @@
+"""Synchronous Windows client SDK for Software Web Manager."""
+
+from .client import Client
+from .errors import (
+    ConfigurationError,
+    CryptographicError,
+    ErrorKind,
+    IdentityError,
+    IntegrityFailureAction,
+    SwmError,
+    UnsupportedPlatformError,
+)
+from .models import (
+    CloudState,
+    DebugDecisionEvent,
+    DebugRequestTicket,
+    DeviceKeyRotationResult,
+    EnrollmentTicket,
+    Event,
+    FeedbackRequest,
+    FeedbackResult,
+    HeartbeatResult,
+    IntegrityEvidence,
+    MaintenanceInfo,
+    OperationAuthorizationRequest,
+    OperationConsumptionReceipt,
+    OperationGrant,
+    UpdateEvent,
+    UpdateInfo,
+    UpdateStreamOptions,
+)
+from .options import (
+    CheckUpdateOptions,
+    ClientOptions,
+    HeartbeatOptions,
+    HostIntegrityOptions,
+    IntegrityEvidenceProvider,
+    ProgressCallback,
+)
+
+__version__ = "2.0.0"
+
+__all__ = [
+    "CheckUpdateOptions",
+    "Client",
+    "ClientOptions",
+    "CloudState",
+    "ConfigurationError",
+    "CryptographicError",
+    "DebugDecisionEvent",
+    "DebugRequestTicket",
+    "DeviceKeyRotationResult",
+    "EnrollmentTicket",
+    "ErrorKind",
+    "Event",
+    "FeedbackRequest",
+    "FeedbackResult",
+    "HeartbeatOptions",
+    "HeartbeatResult",
+    "HostIntegrityOptions",
+    "IdentityError",
+    "IntegrityEvidence",
+    "IntegrityEvidenceProvider",
+    "IntegrityFailureAction",
+    "MaintenanceInfo",
+    "OperationAuthorizationRequest",
+    "OperationConsumptionReceipt",
+    "OperationGrant",
+    "ProgressCallback",
+    "SwmError",
+    "UnsupportedPlatformError",
+    "UpdateEvent",
+    "UpdateInfo",
+    "UpdateStreamOptions",
+    "__version__",
+]

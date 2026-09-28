@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "swm-sdk"
+version = "2.0.0"
+description = "Windows desktop client SDK for Software Web Manager"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "cryptography>=42",
+    "requests>=2.31",
+    "py-cpuinfo>=9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "build",
+    "mypy",
+    "pytest",
+    "pytest-cov",
+    "ruff",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/swm_sdk"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+ignore = ["BLE001", "S110", "S112", "PYI034"]
+
+[tool.mypy]
+python_version = "3.10"
+check_untyped_defs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+warn_unused_ignores = true
